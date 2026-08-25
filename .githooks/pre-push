@@ -1,0 +1,68 @@
+#!/usr/bin/env bash
+# Pre-push gate. Enable once per clone:  bash install-hooks.sh
+#
+# This hook does exactly two things it alone can do -- enforce branch policy, and work
+# out which commits are being pushed. Every actual check lives in scripts/gate.sh,
+# which CI runs too, so the local gate and the pipeline cannot disagree.
+#
+# Emergency bypass:  git push --no-verify
+# Only when the gate itself is broken. Tell the team the same day.
+
+set -u
+
+root="$(git rev-parse --show-toplevel)"
+zero="0000000000000000000000000000000000000000"
+
+# git feeds the ref list on stdin, and reading it consumes it. Capture it once so the
+# change-set calculation below can use the same information the branch check does.
+refs="$(cat)"
+
+changed="$(mktemp)"
+trap 'rm -f "$changed"' EXIT
+
+while read -r local_ref local_sha remote_ref remote_sha; do
+  [ -n "${local_ref:-}" ] || continue
+
+  # Branch policy. `master` is covered as well as `main` -- a repo that uses the older
+  # default should not be silently unprotected.
+  case "$remote_ref" in
+    refs/heads/main|refs/heads/master)
+      echo "Direct pushes to '${remote_ref#refs/heads/}' are not allowed."
+      echo "Push a feature branch and open a PR:  git push -u origin feat/<name>"
+      exit 1
+      ;;
+  esac
+
+  # A branch deletion has nothing to check.
+  [ "$local_sha" = "$zero" ] && continue
+
+  if [ "$remote_sha" = "$zero" ]; then
+    # New branch: no remote side to diff against. Prefer the fork point from the
+    # default branch; if there isn't one (first push of a fresh repo), treat every
+    # tracked file at the tip as new, which for a first push it is.
+    base=""
+    for candidate in refs/heads/main refs/heads/master origin/main origin/master; do
+      if base="$(git merge-base "$local_sha" "$candidate" 2>/dev/null)"; then break; fi
+      base=""
+    done
+    if [ -n "$base" ]; then
+      git diff --name-only --diff-filter=ACM "$base..$local_sha" >> "$changed" 2>/dev/null
+    else
+      git ls-tree -r --name-only "$local_sha" >> "$changed" 2>/dev/null
+    fi
+  else
+    git diff --name-only --diff-filter=ACM "$remote_sha..$local_sha" >> "$changed" 2>/dev/null
+  fi
+done <<EOF
+$refs
+EOF
+
+sort -u -o "$changed" "$changed"
+
+if [ ! -x "$root/scripts/gate.sh" ]; then
+  echo "!! scripts/gate.sh is missing or not executable -- the gate cannot run."
+  echo "   This hook does not pass on its own. Restore it:  chmod +x scripts/gate.sh"
+  exit 1
+fi
+
+exec bash "$root/scripts/gate.sh" --changed-files "$changed"
