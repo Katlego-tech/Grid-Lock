@@ -1,0 +1,34 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# Node
+node_modules/
+dist/
+.vite/
+*.tsbuildinfo
+npm-debug.log*
+pnpm-debug.log*
+
+# Environment & secrets — never commit a real one; .env.example is the shared template
+.env
+.env.*
+!.env.example
+
+# Editors / OS
+.DS_Store
+.idea/
+*.swp
+
+# Local model / index artefacts (RAG store is rebuilt, never committed)
+services/rag-index/store/
+*.faiss
+*.sqlite3

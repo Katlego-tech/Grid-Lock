@@ -1,1 +1,123 @@
-# Grid-Lock
+# GridLock
+
+**A triage engine for community safety reports.**
+_Theme: AI for Safer Communities._
+
+Community safety reporting in South Africa runs on group chats. A home invasion arrives in the same
+undifferentiated feed as a broken streetlight, with the same visual weight, and response time pays
+for it. GridLock is the layer that ranks: it ingests reports, assigns each one a priority tier
+grounded in local context, corroborates it against other reports from the same area, and hands
+responders a queue ordered by what actually matters.
+
+> **Status: pre-implementation.** The architecture and contracts are designed; no service code
+> exists yet. The tree below is what is being built, not what is here.
+
+---
+
+## How it works
+
+```
+Reporter ──POST──▶ ingest-api ──persist──▶ PostGIS
+   (phone)          │  202 in ≤200ms
+                    └──publish──▶ RabbitMQ ──▶ triage-engine ──▶ rag-index
+                                       │         (LangChain)      (landmarks)
+                                       │              │
+                                       │           tier + reason
+                                       ▼              ▼
+                                   verifier ◀── report.triaged
+                              (geo-grid corroboration)
+                                       │
+Responder ◀──ranked queue──── ingest-api ◀── PostGIS
+```
+
+Four ideas do the work:
+
+**Acknowledge first, think later.** A person reporting a break-in on a bad connection gets a `202`
+in under 200ms. The AI never sits in that path. Triage happens asynchronously off a durable queue,
+so a model outage degrades the ranking — it does not drop the report.
+
+**Four tiers, and a reason for each.** `MONITOR` → `ADVISORY` → `URGENT` → `CRITICAL_DISPATCH`.
+Every assignment is persisted with the model's stated reason, the evidence it retrieved, the model
+id and the prompt version. A tier a responder can't interrogate is a tier they can't act on.
+
+**Grounded in real places.** People describe locations as "the Spar on Vilakazi", not as
+coordinates. A retrieval step resolves landmark language against a local index. When it can't — no
+match, or two matches — the location is recorded as *unresolved*, never guessed. A confidently wrong
+address is worse than an honest blank.
+
+**Corroboration is counted, not believed.** Reports landing in the same geographic grid cell inside
+the same time window are grouped into one incident, and responders see the count. Six independent
+reports and one panicked one look different on the screen, because they are different.
+
+## Architecture
+
+| Layer | Technology | Function |
+| --- | --- | --- |
+| Ingest | FastAPI (Python 3.13) | Asynchronous intake; persist-then-publish, acknowledge immediately |
+| Messaging | RabbitMQ 4.x | Topic exchange, durable queues, dead-letter queue — services stay decoupled |
+| Orchestration | LangChain | Portable triage logic: prompts as versioned files, no transport types in the chain |
+| Retrieval | Vector index over local landmarks | Grounds tier assignment in context that actually exists |
+| Verification | Geo-grid + time window | Cross-references reports into incidents; corroboration is a `COUNT(*)` |
+| Data | PostgreSQL 17 + PostGIS | Reports, results, incidents — with the grounding rules enforced as DB constraints |
+| Frontend | React 19 + Vite + shadcn/ui | Mobile-first reporter form; ranked responder console |
+
+The triage chain deliberately imports no web-framework or database types. The brief commits to a
+possible Java migration; that promise is only real if the logic is portable, so it is tested rather
+than asserted.
+
+Because the services are decoupled by a broker, adding a new report source later — CCTV, IoT
+sensors — is a new publisher on an existing exchange, not a rebuild. Reports carry a
+`source_channel` field from day one for that reason.
+
+## Repository layout
+
+```
+apps/web/              React + Vite + shadcn/ui — reporter form and responder console
+services/
+  ingest-api/          FastAPI: accept → persist → publish → 202
+  triage-engine/       LangChain: consume → retrieve → tier → validate → publish
+  verifier/            geo-grid + time-window corroboration; owns Incident
+  rag-index/           landmark ingestion, embedding, retrieval
+packages/contracts/    shared enums and payload models — imported, never re-declared
+infra/                 RabbitMQ definitions, PostGIS init and migrations
+data/landmarks/        committed source data the retrieval index is rebuilt from
+docker-compose.yml     the whole system, locally
+```
+
+## Running it
+
+Not yet runnable — the services are being built. When they are:
+
+```bash
+uv python install 3.13     # the project pins 3.13
+docker compose up -d       # broker, database, services
+```
+
+Requirements: Python 3.13, Node 24 LTS, Docker with Compose v2+.
+
+## Design principles
+
+These are enforced in review and in tests, not just written down:
+
+1. **Never invent an incident, a location, a corroborating report, or a tier.** Every field in a
+   result traces to the reporter's own text or to a landmark in the index. No match means `null` and
+   a tier assigned from the text alone — never a plausible-sounding suburb. A model returning a tier
+   outside the four legal values is rejected for human review, never rounded to the nearest one.
+2. **Never lose a report.** Persist before publish; acknowledge before triage. Broker down, model
+   down, index down — the report still exists and still reaches a responder, with the failure
+   attached. Losing a safety report is the one unacceptable outcome; being unable to rank one is
+   merely bad.
+3. **Every dispatch-affecting decision is explainable.** Tier, reason, evidence, model id and prompt
+   version are persisted together, always.
+4. **Corroboration is arithmetic.** It counts persisted reports. It never asks a model whether two
+   reports describe the same event.
+
+## Team
+
+| | |
+| --- | --- |
+| Katlego ([@Katlego-tech](https://github.com/Katlego-tech)) | Project leader |
+| Kamo | Co-builder |
+
+**Contributing:** branch → PR into `main` → review → merge. No direct pushes to `main`. Commits are
+formatted `type(scope): Tnnn short description`, where `Tnnn` is the task the commit closes.
