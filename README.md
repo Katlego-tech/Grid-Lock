@@ -119,5 +119,32 @@ These are enforced in review and in tests, not just written down:
 | Katlego ([@Katlego-tech](https://github.com/Katlego-tech)) | Project leader |
 | Kamo | Co-builder |
 
-**Contributing:** branch → PR into `main` → review → merge. No direct pushes to `main`. Commits are
-formatted `type(scope): Tnnn short description`, where `Tnnn` is the task the commit closes.
+## Contributing
+
+Branch → PR into `main` → green CI → review → merge. No direct pushes to `main`. Commits are
+formatted `type(scope): short description`.
+
+**First thing, in every clone:**
+
+```bash
+bash install-hooks.sh
+```
+
+This enables the pre-push gate and self-tests it. `core.hooksPath` lives in `.git/config`, which is
+never cloned — until you run this you have no local checks at all, and a push straight to `main`
+will succeed. There is no server-side branch protection on this repository, so the hook is not a
+convenience; it is the protection.
+
+Before opening a PR:
+
+```bash
+bash scripts/gate.sh
+```
+
+It must be green — and green because it *ran*. Read the check count it prints. A gate that finds
+nothing to run in a tree that has code is a misconfiguration, not a pass, and the script will say so
+rather than quietly exiting zero.
+
+Every check lives in `scripts/gate.sh`, and both the pre-push hook and CI run that same file. If you
+need a new check, add it there — never to the workflow alone, or the two start disagreeing about the
+same commit and people learn to ignore the local one.
