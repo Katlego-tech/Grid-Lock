@@ -1,0 +1,96 @@
+# CI -- the backstop for the local pre-push gate.
+#
+# The local hook is opt-in (core.hooksPath is not cloned) and bypassable (--no-verify),
+# so it is the fast feedback loop, not the authority. This is the authority: it runs on
+# hardware nobody can configure their way around.
+#
+# It deliberately runs the SAME scripts/gate.sh the hook runs. Do not add checks here
+# that the hook doesn't have -- add them to gate.sh and both get them. A pipeline that
+# has drifted from the local gate teaches people to ignore the local gate.
+#
+# Toolchain versions below are pinned to what the project targets: Python 3.13, Node 24 LTS.
+# Keep them in step with the project's pinned runtimes. Everything after "Run the gate" is
+# meant to stay as it is.
+
+name: CI
+
+on:
+  push:
+    branches-ignore: []
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # The placeholder sweep needs the commits being introduced, not just the tip.
+          fetch-depth: 0
+
+      # --- toolchain -------------------------------------------------------
+      # Pinned, not "latest". An unpinned toolchain turns an unrelated upstream
+      # release into a red build on a branch that changed nothing.
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      # --- dependencies ----------------------------------------------------
+      # gate.sh treats "dependencies not installed" as a failure, so these steps
+      # are what make it able to run rather than able to complain.
+      - name: Install Python dependencies
+        run: |
+          if [ -f pyproject.toml ]; then
+            uv sync --frozen || uv sync
+          elif [ -f requirements.txt ]; then
+            uv venv .venv
+            uv pip install -r requirements.txt
+          fi
+
+      - name: Install Node dependencies
+        run: |
+          for d in . apps/* packages/* services/*; do
+            [ -f "$d/package.json" ] || continue
+            echo "npm ci in $d"
+            ( cd "$d" && (npm ci || npm install) )
+          done
+
+      # --- the gate --------------------------------------------------------
+      - name: Compute the change set
+        id: changes
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            base="${{ github.event.pull_request.base.sha }}"
+            head="${{ github.event.pull_request.head.sha }}"
+            git diff --name-only --diff-filter=ACM "$base..$head" > /tmp/changed.txt
+          else
+            before="${{ github.event.before }}"
+            if [ -n "$before" ] && [ "$before" != "0000000000000000000000000000000000000000" ] \
+               && git cat-file -e "$before^{commit}" 2>/dev/null; then
+              git diff --name-only --diff-filter=ACM "$before..${{ github.sha }}" > /tmp/changed.txt
+            else
+              git ls-tree -r --name-only "${{ github.sha }}" > /tmp/changed.txt
+            fi
+          fi
+          echo "$(wc -l < /tmp/changed.txt) file(s) in the change set"
+
+      - name: Run the gate
+        run: bash scripts/gate.sh --changed-files /tmp/changed.txt
