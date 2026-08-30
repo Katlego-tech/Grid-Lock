@@ -10,7 +10,7 @@ grounded in local context, corroborates it against other reports from the same a
 responders a queue ordered by what actually matters.
 
 > **Status: pre-implementation.** The architecture and contracts are designed; no service code
-> exists yet. The tree below is what is being built, not what is here.
+> exists yet. The tree below is what is being built, not what is here. 
 
 ---
 
