@@ -10,7 +10,7 @@ grounded in local context, corroborates it against other reports from the same a
 responders a queue ordered by what actually matters.
 
 > **Status: pre-implementation.** The architecture and contracts are designed; no service code
-> exists yet. The tree below is what is being built, not what is here. 
+> exists yet. The tree below is what is being built, not what is here.
 
 ---
 
@@ -18,7 +18,7 @@ responders a queue ordered by what actually matters.
 
 ```
 Reporter ──POST──▶ ingest-api ──persist──▶ PostGIS
-   (phone)          │  202 in ≤200ms
+(Expo app)          │  202 in ≤200ms
                     └──publish──▶ RabbitMQ ──▶ triage-engine ──▶ rag-index
                                        │         (LangChain)      (landmarks)
                                        │              │
@@ -28,6 +28,7 @@ Reporter ──POST──▶ ingest-api ──persist──▶ PostGIS
                               (geo-grid corroboration)
                                        │
 Responder ◀──ranked queue──── ingest-api ◀── PostGIS
+(web console)
 ```
 
 Four ideas do the work:
@@ -59,7 +60,8 @@ reports and one panicked one look different on the screen, because they are diff
 | Retrieval | Vector index over local landmarks | Grounds tier assignment in context that actually exists |
 | Verification | Geo-grid + time window | Cross-references reports into incidents; corroboration is a `COUNT(*)` |
 | Data | PostgreSQL 17 + PostGIS | Reports, results, incidents — with the grounding rules enforced as DB constraints |
-| Frontend | React 19 + Vite + shadcn/ui | Mobile-first reporter form; ranked responder console |
+| Reporter client | Expo SDK 57 + React Native 0.87 | The resident-facing app: submit on bad signal, queue offline, never guess a location |
+| Responder client | React 19 + Vite + shadcn/ui | The ranked queue console responders work from |
 
 The triage chain deliberately imports no web-framework or database types. The brief commits to a
 possible Java migration; that promise is only real if the logic is portable, so it is tested rather
@@ -72,13 +74,15 @@ sensors — is a new publisher on an existing exchange, not a rebuild. Reports c
 ## Repository layout
 
 ```
-apps/web/              React + Vite + shadcn/ui — reporter form and responder console
+apps/web/              React + Vite + shadcn/ui — responder console
+apps/mobile/           Expo + React Native — resident reporter app
 services/
   ingest-api/          FastAPI: accept → persist → publish → 202
   triage-engine/       LangChain: consume → retrieve → tier → validate → publish
   verifier/            geo-grid + time-window corroboration; owns Incident
   rag-index/           landmark ingestion, embedding, retrieval
-packages/contracts/    shared enums and payload models — imported, never re-declared
+packages/contracts/    shared enums and payload models — imported, never re-declared;
+                       TypeScript types are generated from them, never hand-written
 infra/                 RabbitMQ definitions, PostGIS init and migrations
 data/landmarks/        committed source data the retrieval index is rebuilt from
 docker-compose.yml     the whole system, locally
@@ -114,10 +118,18 @@ These are enforced in review and in tests, not just written down:
 
 ## Team
 
-| | |
-| --- | --- |
-| Katlego ([@Katlego-tech](https://github.com/Katlego-tech)) | Project leader |
-| Kamo | Co-builder |
+| | Backend | Client surface |
+| --- | --- | --- |
+| Katlego ([@Katlego-tech](https://github.com/Katlego-tech)) | `triage`, `rag` — the LangChain path | `apps/mobile` — the reporter app |
+| Kamo | `ingest`, `verify`, `infra` — the deterministic path | `apps/web` — the responder console |
+
+Both of us work the backend first, split at the LLM seam so the tightly-coupled pieces stay with one
+person: `triage` calls `rag` on every report, and `ingest` and `verify` share the grid-cell and
+persistence model. The client surfaces split only once the backend is up.
+
+Because two people build two clients against one API, `packages/contracts` is the seam between us —
+its Pydantic models are the single source of truth and the TypeScript types are generated from them.
+A schema disagreement should break a build, not a demo.
 
 ## Contributing
 
