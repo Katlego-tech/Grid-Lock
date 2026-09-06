@@ -124,18 +124,60 @@ These are enforced in review and in tests, not just written down:
 Branch → PR into `main` → green CI → review → merge. No direct pushes to `main`. Commits are
 formatted `type(scope): short description`.
 
-**First thing, in every clone:**
+### Setting up your clone
+
+Do this once, immediately after cloning, before you write anything.
+
+**1. Install the hooks.**
 
 ```bash
 bash install-hooks.sh
 ```
 
-This enables the pre-push gate and self-tests it. `core.hooksPath` lives in `.git/config`, which is
-never cloned — until you run this you have no local checks at all, and a push straight to `main`
-will succeed. There is no server-side branch protection on this repository, so the hook is not a
-convenience; it is the protection.
+**2. Read what it prints.** It does not just install — it proves the hook works, because a gate
+nobody has watched fire is indistinguishable from no gate:
 
-Before opening a PR:
+```
+Installing the pre-push gate for this clone...
+  core.hooksPath = .githooks
+
+Self-test 1/2: does the hook reject a push to main?
+  ok -- pushes to main are rejected.
+
+Self-test 2/2: what will the gate actually run here?
+  ...
+```
+
+If self-test 1 says `FAIL -- the hook allowed a push to main`, stop. Don't push anything until it
+passes; at that point you have no protection at all and neither does the branch.
+
+**3. Verify it stuck.**
+
+```bash
+git config --get core.hooksPath
+```
+
+This must print `.githooks`. Anything else — blank, an error — means the hook is not installed, no
+matter what step 1 appeared to say.
+
+**Why this is a script and not a sentence.** `core.hooksPath` lives in `.git/config`, and
+`.git/config` is **never cloned**. Hooks are not version-controlled state. So the person who set the
+repo up has the gate and nobody else does, silently, until they run this. There is no server-side
+branch protection on this repository — GitHub gates that behind a paid plan for private repos — so
+this hook is not a convenience, it is the only thing standing between a stray `git push` and `main`.
+CI cannot cover for it: CI runs *after* the ref has already moved, and reports. It cannot refuse.
+
+If it is working, a push to `main` looks like this — this is the gate doing its job, not a bug:
+
+```
+Direct pushes to 'main' are not allowed.
+Push a feature branch and open a PR:  git push -u origin feat/<name>
+```
+
+`--no-verify` skips all of it. If the gate is wrong, fix `scripts/gate.sh`; don't reach for
+`--no-verify` twice.
+
+### Before every PR
 
 ```bash
 bash scripts/gate.sh
