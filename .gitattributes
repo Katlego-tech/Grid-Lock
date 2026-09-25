@@ -1,0 +1,9 @@
+# Normalise line endings in the repo; check out shell scripts as LF on every OS.
+#
+# Bash cannot run a script with CRLF endings: every line ends in a stray \r, so the
+# pre-push hook dies on its first command instead of checking anything. On Windows,
+# Git converts to CRLF on checkout unless told otherwise -- this is telling it.
+* text=auto
+
+*.sh      text eol=lf
+.githooks/* text eol=lf
