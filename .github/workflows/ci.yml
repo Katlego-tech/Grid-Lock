@@ -9,14 +9,14 @@
 # has drifted from the local gate teaches people to ignore the local gate.
 #
 # Toolchain versions below are pinned to what the project targets: Python 3.13, Node 24 LTS.
-# Keep them in step with the project's pinned runtimes. Everything after "Run the gate" is
-# meant to stay as it is.
+# Keep them in step with the project's pinned runtimes. Dependencies are installed through
+# gate.sh itself, and everything from there on is meant to stay as it is.
 
 name: CI
 
 on:
   push:
-    branches-ignore: []
+    branches: ["**"]        # every branch (tags don't run the gate)
   pull_request:
     branches: [main]
 
@@ -30,48 +30,65 @@ jobs:
     timeout-minutes: 20
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           # The placeholder sweep needs the commits being introduced, not just the tip.
           fetch-depth: 0
 
       # --- toolchain -------------------------------------------------------
       # Pinned, not "latest". An unpinned toolchain turns an unrelated upstream
-      # release into a red build on a branch that changed nothing.
+      # release into a red build on a branch that changed nothing. Every action
+      # here runs on Node 24; the Node 20 versions they replace are deprecated.
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
         with:
           python-version: '3.13'
 
+      # setup-uv stopped publishing major tags (like @v10) in v8, so it is pinned
+      # to a full release. Bump it deliberately; there is no tag that moves for you.
       - name: Set up uv
-        uses: astral-sh/setup-uv@v5
+        uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4  # v10.1.0
         with:
           enable-cache: true
 
       - name: Set up Node
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020  # v7.0.0
         with:
           node-version: '24'
+          # Since v5 this action caches npm dependencies on its own when package.json
+          # names npm as the package manager. This workflow never cached them, and
+          # the install goes through gate.sh -- keep it that way.
+          package-manager-cache: false
+
+      # pnpm and yarn come with Node through corepack; this puts them on PATH, so a
+      # project locked with pnpm-lock.yaml or yarn.lock installs and runs with the
+      # manager it was locked with. (bun.lockb needs oven-sh/setup-bun -- add it here.)
+      - name: Enable pnpm and yarn
+        run: corepack enable
+
+      # The gate's vulnerability scan checks every lockfile against the OSV database.
+      # A pinned release, verified against its published checksum before it runs.
+      - name: Set up osv-scanner
+        env:
+          OSV_SCANNER_VERSION: v2.5.1
+        run: |
+          cd "$RUNNER_TEMP"
+          base="https://github.com/google/osv-scanner/releases/download/$OSV_SCANNER_VERSION"
+          curl -sSfLO "$base/osv-scanner_linux_amd64"
+          curl -sSfLO "$base/osv-scanner_SHA256SUMS"
+          grep ' osv-scanner_linux_amd64$' osv-scanner_SHA256SUMS | sha256sum -c -
+          mkdir -p "$HOME/.local/bin"
+          install -m 0755 osv-scanner_linux_amd64 "$HOME/.local/bin/osv-scanner"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
       # --- dependencies ----------------------------------------------------
-      # gate.sh treats "dependencies not installed" as a failure, so these steps
-      # are what make it able to run rather than able to complain.
-      - name: Install Python dependencies
-        run: |
-          if [ -f pyproject.toml ]; then
-            uv sync --frozen || uv sync
-          elif [ -f requirements.txt ]; then
-            uv venv .venv
-            uv pip install -r requirements.txt
-          fi
-
-      - name: Install Node dependencies
-        run: |
-          for d in . apps/* packages/* services/*; do
-            [ -f "$d/package.json" ] || continue
-            echo "npm ci in $d"
-            ( cd "$d" && (npm ci || npm install) )
-          done
+      # gate.sh treats "dependencies not installed" as a failure, so this step is
+      # what makes it able to run rather than able to complain. It goes through
+      # gate.sh on purpose: the installer walks the same directories and picks the
+      # same package manager as the checks do. This used to be a loop here with its
+      # own directory list, and CI stopped installing folders the gate still checked.
+      - name: Install dependencies
+        run: bash scripts/gate.sh --install-deps
 
       # --- the gate --------------------------------------------------------
       - name: Compute the change set

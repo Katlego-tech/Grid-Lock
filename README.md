@@ -199,6 +199,21 @@ It must be green — and green because it *ran*. Read the check count it prints.
 nothing to run in a tree that has code is a misconfiguration, not a pass, and the script will say so
 rather than quietly exiting zero.
 
+What it runs, once there is code: per Python project `ruff check`, `ruff format --check`, `pyright`
+and `pytest`; per Node package its `lint`, `test` and `build` scripts; then across the whole repo
+the placeholder and secret sweeps, a dependency vulnerability scan of every committed lockfile, and
+a duplication check. A check that cannot run fails, so your machine needs:
+
+- `ruff` and `pyright` as dev dependencies of each Python project — `uv add --dev ruff pyright`
+- a `lint` script in each `package.json` — e.g. `"eslint . && prettier --check . && tsc --noEmit"`
+- a committed lockfile for every project (`uv lock`, or the package manager's own)
+- [`osv-scanner`](https://google.github.io/osv-scanner/installation/) on your `PATH`, and `npx`
+  (it comes with Node) for the duplication check
+
+A vulnerability with no fixed release yet is declared in `osv-scanner.toml` at the repo root, with
+its reason naming the follow-up that will close it (`T012: …` or `#12: …`). A deliberate copy of
+code is marked with `jscpd:ignore-start` / `jscpd:ignore-end` and a reason beside it.
+
 Every check lives in `scripts/gate.sh`, and both the pre-push hook and CI run that same file. If you
 need a new check, add it there — never to the workflow alone, or the two start disagreeing about the
 same commit and people learn to ignore the local one.

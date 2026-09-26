@@ -13,6 +13,7 @@
 #   bash scripts/gate.sh                          # sweep placeholders over the whole tree
 #   bash scripts/gate.sh --changed-files <path>   # sweep only the paths listed in <path>
 #   bash scripts/gate.sh --list                   # print what it would run, run nothing
+#   bash scripts/gate.sh --install-deps           # install every project's deps (CI uses this)
 #
 # Exit codes: 0 = every applicable check ran and passed. 1 = something failed, or a
 # check that should have run could not run. There is deliberately no third state --
@@ -41,11 +42,13 @@ cd "$root"
 
 changed_files_list=""
 list_only=0
+install_only=0
 
 while [ $# -gt 0 ]; do
   case "$1" in
     --changed-files) changed_files_list="${2:-}"; shift 2 ;;
     --list)          list_only=1; shift ;;
+    --install-deps)  install_only=1; shift ;;
     -h|--help)       sed -n '2,36p' "$0"; exit 0 ;;
     *) echo "gate.sh: unknown argument '$1'" >&2; exit 2 ;;
   esac
@@ -61,6 +64,13 @@ manifests=0
 # package. An entry here does not make the gate pass quietly; it still reports
 # the gap on every run.
 declare -A UNTESTED=()
+
+# Tunables for the checks below. They live here, not in CI or the hook, like everything else.
+DUPLICATION_THRESHOLD=5   # max % of duplicated lines across the repo's source (jscpd)
+JSCPD_VERSION=5.2.0       # pinned: npx fetches exactly this version, never "latest"
+
+# Committed lockfiles of the projects found, scanned together by vuln_scan().
+LOCKFILES=()
 
 say()  { printf '%s\n' "$*"; }
 step() { printf '\n-> %s\n' "$*"; }
@@ -103,6 +113,10 @@ pyrun() {
   fi
 }
 
+is_python_project() {
+  [ -f "$1/pyproject.toml" ] || [ -f "$1/requirements.txt" ] || [ -f "$1/setup.py" ]
+}
+
 resolve_python() {
   local dir="$1"
   py_runner=""; py_kind=""; py_venv=""
@@ -129,7 +143,7 @@ resolve_python() {
 
 check_python() {
   local dir="$1" rel="$2" rc
-  { [ -f "$dir/pyproject.toml" ] || [ -f "$dir/requirements.txt" ] || [ -f "$dir/setup.py" ]; } || return 0
+  is_python_project "$dir" || return 0
   manifests=$((manifests + 1))
 
   if ! resolve_python "$dir"; then
@@ -142,7 +156,7 @@ check_python() {
   fi
   say "   python: $py_kind"
 
-  if [ "$list_only" -eq 1 ]; then say "   would run: ruff, pytest ($rel)"; return 0; fi
+  if [ "$list_only" -eq 1 ]; then say "   would run: ruff check, ruff format --check, pyright, pytest ($rel)"; return 0; fi
 
   # Static analysis is part of the gate, not a nicety. Code rots one commit at a
   # time; the cheapest place to catch it is here.
@@ -153,7 +167,24 @@ check_python() {
     pyrun "$dir" ruff format --check . || fail=1
     ran=$((ran + 1))
   else
-    say "   ruff not available in this environment -- skipping lint (tests still gate)."
+    # The skip rule covers lint exactly as it covers tests. This used to print
+    # "skipping lint" and carry on -- a skipped check reporting green.
+    bad "$rel has no ruff in its environment, so its lint and format checks cannot run."
+    bad "   Add it as a dev dependency:  uv add --dev ruff   (or list it in requirements.txt)"
+    fail=1
+  fi
+
+  # Type checking -- the tool pyrun() sets VIRTUAL_ENV for. It catches the call that
+  # passes a str where the signature says int, which lint can't see and a test only
+  # sees if someone thought to write that test.
+  if pyrun "$dir" pyright --version >/dev/null 2>&1; then
+    step "pyright ($rel)"
+    pyrun "$dir" pyright || fail=1
+    ran=$((ran + 1))
+  else
+    bad "$rel has no pyright in its environment, so its type check cannot run."
+    bad "   Add it as a dev dependency:  uv add --dev pyright   (or list it in requirements.txt)"
+    fail=1
   fi
 
   step "pytest ($rel)"
@@ -170,19 +201,33 @@ check_python() {
 }
 
 # ------------------------------------------------------------------ Node ----
+# The package manager is whatever the committed lockfile says it is, not npm by
+# assumption. Running `npm run build` in a pnpm workspace either fails outright or
+# silently resolves a different dependency tree than the one that was locked.
+node_pm() {
+  local dir="$1"
+  if   [ -f "$dir/pnpm-lock.yaml" ] || [ -f "$root/pnpm-lock.yaml" ]; then echo pnpm
+  elif [ -f "$dir/yarn.lock" ]      || [ -f "$root/yarn.lock" ];      then echo yarn
+  elif [ -f "$dir/bun.lock" ] || [ -f "$dir/bun.lockb" ] \
+       || [ -f "$root/bun.lock" ] || [ -f "$root/bun.lockb" ];        then echo bun
+  else echo npm
+  fi
+}
+
+# Does the package.json in $1 declare script $2? Ask package.json directly:
+# `npm test --if-present` exits 0 when there is no test script at all, which reads
+# as a pass.
+has_script() {
+  node -e 'const p=require(process.argv[1]);process.exit(p.scripts&&p.scripts[process.argv[2]]?0:1)' \
+    "$1/package.json" "$2" 2>/dev/null
+}
+
 check_node() {
-  local dir="$1" rel="$2"
+  local dir="$1" rel="$2" pm
   [ -f "$dir/package.json" ] || return 0
   manifests=$((manifests + 1))
 
-  # The package manager is whatever the committed lockfile says it is, not npm by
-  # assumption. Running `npm run build` in a pnpm workspace either fails outright or
-  # silently resolves a different dependency tree than the one that was locked.
-  local pm=npm
-  if   [ -f "$dir/pnpm-lock.yaml" ] || [ -f "$root/pnpm-lock.yaml" ]; then pm=pnpm
-  elif [ -f "$dir/yarn.lock" ]      || [ -f "$root/yarn.lock" ];      then pm=yarn
-  elif [ -f "$dir/bun.lockb" ]      || [ -f "$root/bun.lockb" ];      then pm=bun
-  fi
+  pm="$(node_pm "$dir")"
   if ! command -v "$pm" >/dev/null 2>&1; then
     bad "$rel is locked to '$pm' (its lockfile says so) but '$pm' is not on PATH."
     bad "   Install it, or the gate cannot run this package's checks."
@@ -205,16 +250,30 @@ check_node() {
     return 0
   fi
 
-  # `npm test --if-present` exits 0 when there is no test script at all, which reads
-  # as a pass. Ask package.json directly instead of trusting the exit code.
-  local has_test=no has_build=no
-  node -e "const p=require('$dir/package.json');process.exit(p.scripts&&p.scripts.test?0:1)"  2>/dev/null && has_test=yes
-  node -e "const p=require('$dir/package.json');process.exit(p.scripts&&p.scripts.build?0:1)" 2>/dev/null && has_build=yes
+  local has_lint=no has_test=no has_build=no
+  has_script "$dir" lint  && has_lint=yes
+  has_script "$dir" test  && has_test=yes
+  has_script "$dir" build && has_build=yes
 
   if [ "$list_only" -eq 1 ]; then
-    say "   would run ($pm): $( [ "$has_test" = yes ] && printf 'test ' )$( [ "$has_build" = yes ] && printf 'build ' )($rel)"
+    say "   would run ($pm): $( [ "$has_lint" = yes ] && printf 'lint ' )$( [ "$has_test" = yes ] && printf 'test ' )$( [ "$has_build" = yes ] && printf 'build ' )($rel)"
+    [ "$has_lint" = no ] && say "   (no 'lint' script -- would FAIL)"
     [ "$has_test" = no ] && say "   (no 'test' script -- would FAIL)"
     return 0
+  fi
+
+  # Static analysis runs before the tests, as it does for Python. The gate can't know
+  # which JS tools a package uses, so the package declares them in its `lint` script
+  # -- and a package without one fails, the same way a Python project without ruff does.
+  if [ "$has_lint" = yes ]; then
+    step "$pm run lint ($rel)"
+    ( cd "$dir" && "$pm" run lint ) || fail=1
+    ran=$((ran + 1))
+  else
+    bad "$rel declares no 'lint' script, so its code ships unanalysed."
+    bad "   Add one that runs its static checks, e.g."
+    bad "   \"lint\": \"eslint . && prettier --check . && tsc --noEmit\""
+    fail=1
   fi
 
   if [ "$has_test" = yes ]; then
@@ -367,23 +426,255 @@ secret_sweep() {
   ran=$((ran + 1))
 }
 
+# ------------------------------------------------------------- lockfiles ----
+# Echo the committed lockfile pinning $1's dependencies of kind $2 (py | node): the
+# directory's own, else the workspace root's. Committed only -- CI's install step
+# generates a lockfile when none exists, and a generated one pins nothing anyone
+# reviewed. requirements.txt counts only in the project's own directory, and only
+# its == pins are exact enough to scan.
+committed_lockfile() {
+  local dir="$1" kind="$2" d f names path
+  for d in "$dir" "$root"; do
+    if [ "$kind" = py ]; then
+      names="uv.lock poetry.lock pdm.lock Pipfile.lock"
+      [ "$d" = "$dir" ] && names="$names requirements.txt"
+    else
+      names="pnpm-lock.yaml yarn.lock bun.lock package-lock.json npm-shrinkwrap.json"
+    fi
+    for f in $names; do
+      path="${d#"$root"}"; path="${path#/}"; path="${path:+$path/}$f"
+      if git ls-files --error-unmatch -- "$path" >/dev/null 2>&1; then
+        printf '%s\n' "$path"; return 0
+      fi
+    done
+  done
+  return 1
+}
+
+# Every project needs one. Without it there is nothing exact to scan for vulnerabilities,
+# and nothing reproducible to install -- so a
+# missing lockfile fails here rather than letting the scan quietly cover less.
+collect_lockfiles() {
+  local dir="$1" rel="$2" kind lock
+  for kind in py node; do
+    if [ "$kind" = py ]; then is_python_project "$dir" || continue
+    else [ -f "$dir/package.json" ] || continue
+    fi
+    if lock="$(committed_lockfile "$dir" "$kind")"; then
+      case " ${LOCKFILES[*]:-} " in *" $lock "*) ;; *) LOCKFILES+=("$lock") ;; esac
+    else
+      bad "$rel has no committed lockfile, so its dependencies cannot be scanned for known vulnerabilities."
+      if [ "$kind" = py ]; then
+        bad "   Create one with  uv lock  (or pin every line of requirements.txt with ==), and commit it."
+      else
+        bad "   Run '$(node_pm "$dir") install' and commit the lockfile it writes."
+      fi
+      fail=1
+    fi
+  done
+}
+
+# ------------------------------------------------------- vulnerabilities ----
+# Every committed lockfile, checked against OSV (which aggregates the GitHub, PyPI and
+# other advisory feeds). Unlike every other check here, the result can change while the
+# code doesn't: an advisory published tonight fails tomorrow's push on a branch nobody
+# touched. That is the point -- a vulnerable dependency is exactly as vulnerable in
+# unchanged code.
+#
+# Exemptions live in osv-scanner.toml at the repo root, one [[IgnoredVulns]] block each,
+# under the same rule as UNTESTED: the reason names the tracked follow-up that will close
+# it (a task ID like T012, or an issue like #12), and every run prints it. An ignoreUntil date makes an exemption expire on its own.
+osv_exemptions() {   # prints "id<TAB>reason" per [[IgnoredVulns]] block of $1
+  awk '
+    function flush() { if (inblock) printf "%s\t%s\n", id, reason; inblock = 0; id = ""; reason = "" }
+    /^[[:space:]]*\[\[IgnoredVulns\]\]/ { flush(); inblock = 1; next }
+    /^[[:space:]]*\[/                   { flush(); next }
+    inblock && /^[[:space:]]*id[[:space:]]*=/     { v = $0; sub(/^[^=]*=[[:space:]]*/, "", v); gsub(/"/, "", v); id = v }
+    inblock && /^[[:space:]]*reason[[:space:]]*=/ { v = $0; sub(/^[^=]*=[[:space:]]*/, "", v); gsub(/"/, "", v); reason = v }
+    END { flush() }
+  ' "$1"
+}
+
+vuln_scan() {
+  step "dependency vulnerability scan (osv-scanner)"
+  local config="$root/osv-scanner.toml" lock id reason rc
+  local args=()
+
+  if ! command -v osv-scanner >/dev/null 2>&1; then
+    bad "osv-scanner is not on PATH, so dependencies cannot be checked for known vulnerabilities."
+    bad "   Install it: https://google.github.io/osv-scanner/installation/"
+    bad "   e.g.  go install github.com/google/osv-scanner/v2/cmd/osv-scanner@v2.5.1"
+    fail=1
+    return 0
+  fi
+
+  if [ -f "$config" ]; then
+    args+=(--config "$config")
+    while IFS=$'\t' read -r id reason; do
+      if printf '%s' "$reason" | grep -qE '(\bT[0-9]+\b|#[0-9]+\b)'; then
+        bad "   accepted: $id -- $reason"
+      else
+        bad "   $id is ignored in osv-scanner.toml, but its reason names no tracked follow-up."
+        bad "   An exemption nobody owns is a vulnerability nobody fixes: reason = \"T012: ...\" or \"#12: ...\""
+        fail=1
+      fi
+    done < <(osv_exemptions "$config")
+  fi
+
+  for lock in "${LOCKFILES[@]}"; do args+=(-L "$root/$lock"); done
+  say "   lockfiles: ${LOCKFILES[*]}"
+
+  osv-scanner scan source "${args[@]}"
+  rc=$?
+  ran=$((ran + 1))
+  if [ "$rc" -eq 1 ]; then
+    bad "Known vulnerabilities in the dependencies above. Upgrade to the fixed version --"
+    bad "   or, only if none exists yet, declare it in osv-scanner.toml against a tracked follow-up."
+    fail=1
+  elif [ "$rc" -ne 0 ]; then
+    bad "osv-scanner could not complete (exit $rc) -- usually no network. A scan that did not"
+    bad "   run is a failed scan, not a clean one."
+    fail=1
+  fi
+}
+
+# ------------------------------------------------------------ duplication ----
+# Copy-paste across the whole repo, measured by jscpd. AI assistants produce a local copy
+# of logic far more readily than they reuse the shared version, and a multi-service repo
+# hides the copy well: the same helper pasted into services/a and services/b passes every
+# per-service check. So this runs once over all tracked source, and fails when duplicated
+# lines exceed DUPLICATION_THRESHOLD percent.
+#
+# Not counted: tests (repeated, explicit setup is normal there), fixtures and mocks,
+# vendored or built trees, and shadcn/ui's components/ui/ -- copied in from a registry and
+# alike by design. A deliberate copy is marked in the code, with the reason beside it:
+#     # jscpd:ignore-start -- <why this copy is intended>
+#     # jscpd:ignore-end
+duplication_check() {
+  step "duplication check (jscpd $JSCPD_VERSION, threshold $DUPLICATION_THRESHOLD%)"
+  local files out rc
+
+  files="$(git ls-files \
+            | grep -E '\.(py|ts|tsx|js|jsx|mjs|cjs|go|rs|java|rb|php|c|cc|cpp|h|hpp|cs|kt|swift)$' \
+            | grep -Ev '(^|/)(docs|legacy|fixtures|mocks|__mocks__|testdata|node_modules|vendor|dist|build|tests?|__tests__)/' \
+            | grep -Ev '(^|/)components/ui/' \
+            | grep -Ev '(\.(test|spec)\.[a-z]+|(^|/)test_[^/]*\.py|_test\.(py|go))$' || true)"
+  if [ -z "$files" ]; then
+    say "   no source files to compare"
+    ran=$((ran + 1))
+    return 0
+  fi
+
+  if ! command -v npx >/dev/null 2>&1; then
+    bad "npx is not on PATH, so the duplication check (jscpd) cannot run. Install Node.js."
+    fail=1
+    return 0
+  fi
+
+  out="$(mktemp)"
+  # shellcheck disable=SC2086
+  ( cd "$root" && npx --yes "jscpd@$JSCPD_VERSION" --threshold "$DUPLICATION_THRESHOLD" \
+      --reporters console --no-colors $files ) 2>&1 | tee "$out"
+  rc=${PIPESTATUS[0]}
+  ran=$((ran + 1))
+  if [ "$rc" -ne 0 ]; then
+    if grep -q 'too many duplicates' "$out"; then
+      bad "Duplicated code is over the threshold. Reuse the shared version instead of copying it,"
+      bad "   or mark a deliberate copy with jscpd:ignore-start / jscpd:ignore-end and a reason."
+    else
+      bad "jscpd could not run (exit $rc) -- see above. A check that did not run is a failed check."
+    fi
+    fail=1
+  fi
+  rm -f "$out"
+}
+
+# ---------------------------------------------------------------- install ---
+# CI installs dependencies by calling `gate.sh --install-deps`, so the installer walks
+# exactly the directories project_dirs() lists and uses exactly the package manager
+# check_node() will. It used to be a loop in ci.yml with its own directory list, and
+# the two drifted: CI never installed a frontend/ package that the checks then failed
+# for having no node_modules. The pre-push hook never calls this -- locally, a missing
+# install is yours to fix, and the checks say so rather than fixing it behind your back.
+install_deps() {
+  local dir="$1" rel="$2" pm
+
+  if is_python_project "$dir"; then
+    manifests=$((manifests + 1))
+    step "install Python dependencies ($rel)"
+    if ! command -v uv >/dev/null 2>&1; then
+      bad "   uv is not on PATH -- cannot install $rel's dependencies."
+      fail=1
+    elif [ -f "$dir/pyproject.toml" ]; then
+      ( cd "$dir" && { uv sync --frozen || uv sync; } ) || fail=1
+    elif [ -f "$dir/requirements.txt" ]; then
+      ( cd "$dir" && { [ -d .venv ] || uv venv .venv; } && uv pip install -r requirements.txt ) || fail=1
+    else
+      ( cd "$dir" && { [ -d .venv ] || uv venv .venv; } && uv pip install -e . ) || fail=1
+    fi
+  fi
+
+  if [ -f "$dir/package.json" ]; then
+    manifests=$((manifests + 1))
+    pm="$(node_pm "$dir")"
+    step "$pm install ($rel)"
+    if ! command -v "$pm" >/dev/null 2>&1; then
+      bad "   $rel is locked to '$pm' (its lockfile says so) but '$pm' is not on PATH."
+      fail=1
+    elif [ "$pm" = npm ]; then
+      ( cd "$dir" && { npm ci || npm install; } ) || fail=1
+    else
+      ( cd "$dir" && "$pm" install ) || fail=1
+    fi
+  fi
+}
+
 # ------------------------------------------------------------------ run -----
 say "== gate: $(git rev-parse --abbrev-ref HEAD) @ $(git rev-parse --short HEAD) =="
 
 while IFS= read -r dir; do
   rel="${dir#"$root"/}"
   [ "$rel" = "$dir" ] && rel="."
-  check_python "$dir" "$rel"
-  check_node   "$dir" "$rel"
+  if [ "$install_only" -eq 1 ]; then
+    install_deps "$dir" "$rel"
+  else
+    check_python      "$dir" "$rel"
+    check_node        "$dir" "$rel"
+    collect_lockfiles "$dir" "$rel"
+  fi
 done < <(project_dirs)
+
+if [ "$install_only" -eq 1 ]; then
+  say ""
+  if [ "$fail" -ne 0 ]; then say "== dependency install FAILED =="; exit 1; fi
+  say "== dependencies installed for $manifests project manifest(s) =="
+  exit 0
+fi
+
+# --list stops here, before the sweeps. It used to run both of them and then report
+# "nothing was executed".
+if [ "$list_only" -eq 1 ]; then
+  say ""
+  say "-> would run: placeholder sweep, secret sweep"
+  if [ "$manifests" -gt 0 ]; then
+    say "-> would run: dependency vulnerability scan over: ${LOCKFILES[*]:-(no committed lockfiles)}"
+    command -v osv-scanner >/dev/null 2>&1 || say "   (osv-scanner not on PATH -- would FAIL)"
+    say "-> would run: duplication check (jscpd $JSCPD_VERSION, threshold $DUPLICATION_THRESHOLD%)"
+    command -v npx >/dev/null 2>&1 || say "   (npx not on PATH -- would FAIL)"
+  fi
+  say ""
+  say "(--list: no checks were run. $manifests project manifest(s) found.)"
+  exit 0
+fi
 
 placeholder_sweep
 secret_sweep
 
-if [ "$list_only" -eq 1 ]; then
-  say ""
-  say "(--list: nothing was executed. $manifests project manifest(s) found.)"
-  exit 0
+# Both look at the whole repo rather than one project, so they run once, and only once
+# there is a project to look at.
+if [ "$manifests" -gt 0 ]; then
+  [ "${#LOCKFILES[@]}" -gt 0 ] && vuln_scan
+  duplication_check
 fi
 
 # --- the two ways a gate lies about being green ----------------------------
