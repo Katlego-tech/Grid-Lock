@@ -1,6 +1,6 @@
 # Design — `ingest-api`
 
-**Status:** `draft` (Phase 0 fixes under review) · **Owner:** Katlego (Gemini; revised by Claude) ·
+**Status:** `agreed` (Katlego, 2026-09-29) · **Owner:** Katlego (Gemini; revised by Claude) ·
 **Tasks:** `T002` · **Spec:** `US1`, `US5` · **Domain model:** [domain-model.md](domain-model.md)
 
 ---

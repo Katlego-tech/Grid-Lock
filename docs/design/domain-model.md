@@ -1,6 +1,6 @@
 # Design — domain model (shared)
 
-**Status:** `draft` (Phase 0 fixes under review) · **Owner:** Katlego (Claude) · **Tasks:** `T001` ·
+**Status:** `agreed` (Katlego, 2026-09-29) · **Owner:** Katlego (Claude) · **Tasks:** `T001` ·
 **Spec:** user stories `US1–US6`
 
 ---
