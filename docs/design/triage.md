@@ -1,22 +1,19 @@
 # Design — `triage-engine`
 
-**Status:** `agreed` · **Owner:** Katlego (Gemini) · **Tasks:** `T003` ·
-**Spec:** [SPEC.md](../../SPEC.md) `US2, US6` · **Domain Model:** [domain-model.md](domain-model.md)
+**Status:** `draft` (Phase 0 fixes under review) · **Owner:** Katlego (Gemini; revised by Claude) ·
+**Tasks:** `T003` · **Spec:** `US2`, `US6` · **Domain model:** [domain-model.md](domain-model.md)
 
 ---
 
 ## 1. What this covers
 
-The `triage-engine` service is responsible for consuming newly ingested incident reports from RabbitMQ,
-enriching them with landmark evidence retrieved from `rag-index`, invoking a portable LangChain
-triage chain to classify the incident into exactly one of four priority tiers with an explanatory
-reason, validating the result against strict grounding and enum invariants, persisting the
-`TriageResult`, and publishing downstream events.
+`triage-engine` consumes `report.received`, gets landmark evidence from `rag-index`, runs a portable
+LangChain chain that assigns exactly one of four tiers with a one-sentence reason, validates the
+result without coercion, persists a `TriageResult`, and publishes `report.triaged` or
+`report.needs_review`.
 
-It explicitly does **not** cover:
-- HTTP report ingestion or client response deadlines (covered by `docs/design/ingest.md`).
-- Landmark vector embedding, indexing, or storage (covered by `docs/design/rag.md`).
-- Multi-report spatial/temporal corroboration and incident clustering (covered by `docs/design/verification.md`).
+It does **not** cover ingestion (`ingest.md`), embedding and the RESOLVED/AMBIGUOUS/UNKNOWN rule
+(`rag.md`), or corroboration (`verification.md`).
 
 ---
 
@@ -24,29 +21,29 @@ It explicitly does **not** cover:
 
 | Kind | Where |
 | --- | --- |
-| Shared domain model | [docs/design/domain-model.md](domain-model.md) §3 (`TriageResult`), §4 (flow + failure table), §5 (state machine), §6 (AMQP contracts) |
-| User stories | [SPEC.md](../../SPEC.md) `US2` (triage tiers + reasons), `US6` (chain portability) |
-| Architecture principles | [PLAN.md](../../PLAN.md) Non-negotiable 1 (grounded triage), 2 (graceful degradation), 8 (explainability) |
-| Schema contracts | `packages/contracts/gridlock_contracts/` (`Tier`, `ReportState`, `LocationConfidence`, `TriageResult`) |
+| Shared domain model | [domain-model.md](domain-model.md) §3 (`TriageResult` and its two shapes), §4 (failure table), §5 (lifecycle), §6 (AMQP, `RetrievalResult`, delivery semantics) |
+| User stories | `US2` (tier + reason), `US6` (portability) |
+| Governing rules | Never invent a tier or a location; a failure degrades to `NEEDS_REVIEW`, never to a guess; `tier`, `reason`, `evidence`, `model_id`, `prompt_version` are persisted together. Budget: consumed → persisted ≤ 3s p95. |
+| Retrieval contract | [rag.md](rag.md) §7 |
 
 ---
 
 ## 3. Domain model
 
-The data structures consumed, produced, and manipulated by `triage-engine`:
+`TriageResult`, `EvidenceChunk`, `Coordinates` and `RetrievalResult` are exactly as in domain-model
+§3/§6. The chain's own input and output types are below — the class diagram and §6.1 describe the
+same two classes.
 
 ```mermaid
 classDiagram
-    class TriageInput {
-        +UUID report_id
+    class TriageChainInput {
         +str description
-        +Optional~Coordinates~ reported_coords
         +Optional~str~ reported_landmark
         +Optional~str~ category_hint
         +List~EvidenceChunk~ evidence
     }
 
-    class TriageOutput {
+    class TriageChainOutput {
         +Tier tier
         +str reason
     }
@@ -54,13 +51,12 @@ classDiagram
     class TriageResult {
         +UUID id
         +UUID report_id
-        +Tier tier
-        +str reason
+        +Optional~Tier~ tier
+        +Optional~str~ reason
         +List~EvidenceChunk~ evidence
         +Optional~str~ grid_cell
         +Optional~Coordinates~ resolved_coords
         +LocationConfidence location_confidence
-        +int corroboration_count
         +str model_id
         +str prompt_version
         +datetime triaged_at
@@ -73,253 +69,279 @@ classDiagram
         +float similarity
     }
 
-    class Coordinates {
-        +float lat
-        +float lon
-    }
-
-    class Tier {
-        <<enumeration>>
-        MONITOR
-        ADVISORY
-        URGENT
-        CRITICAL_DISPATCH
-    }
-
-    class LocationConfidence {
-        <<enumeration>>
-        EXACT
-        RESOLVED
-        AMBIGUOUS
-        UNKNOWN
-    }
-
-    TriageInput "1" --> "0..*" EvidenceChunk : includes
+    TriageChainInput "1" --> "0..*" EvidenceChunk : evidence
     TriageResult "1" --> "0..*" EvidenceChunk : justified by
-    TriageResult "1" --> "1" Tier : assigns
-    TriageResult "1" --> "1" LocationConfidence : assesses
-    TriageResult "1" --> "0..1" Coordinates : resolved_coords
-    TriageOutput "1" --> "1" Tier : classified
 ```
 
-### Invariants & Business Rules
+### Invariants
 
-1. **Strict 4-Tier Enum**: `tier` must be one of `MONITOR`, `ADVISORY`, `URGENT`, `CRITICAL_DISPATCH`. If the model emits any other token or formatting error, the output is rejected without coercion, setting `Report.state = NEEDS_REVIEW` and recording the raw token in `failure_reason`.
-2. **Grounded One-Sentence Reason**: `reason` must be a single non-empty sentence. It must cite or paraphrase only facts stated in `description` or retrieved in `evidence`. It must never extrapolate unmentioned weapons, suspects, or severities.
-3. **No Location Hallucination**:
-   - If device GPS was submitted: `location_confidence = EXACT`, `grid_cell` resolved from coords.
-   - If a single landmark matched above threshold: `location_confidence = RESOLVED`, `grid_cell` taken from landmark.
-   - If multiple competing landmarks matched: `location_confidence = AMBIGUOUS`, `grid_cell = null`, `resolved_coords = null`.
-   - If no match or index unreachable: `location_confidence = UNKNOWN`, `grid_cell = null`, `resolved_coords = null`.
-   - Database check constraints strictly enforce `grid_cell IS NULL` when `location_confidence IN ('AMBIGUOUS', 'UNKNOWN')`.
-4. **P95 Latency Budget**: Total execution budget from message consumption to persistence is ≤ 3.0s (p95). The LLM call has a hard timeout of 2.5s.
-5. **Initial Corroboration**: `corroboration_count` defaults to 1 upon initial triage; subsequent incrementing is exclusively managed by `verifier`.
+1. **Four tiers, no coercion.** The chain's output is parsed into `TriageChainOutput`. Anything that
+   does not parse — an unknown tier (`"HIGH"`, `"URGENT!"`), missing fields, non-JSON — is a
+   failure: `TriageResult(tier=null, reason=null, failure_reason="invalid model output: <raw>")`,
+   `Report.state = NEEDS_REVIEW`.
+2. **Grounded reason.** One non-empty sentence citing or paraphrasing only the description and the
+   evidence. The chain cannot enforce this; the grounding test in §9 checks it.
+3. **Location is decided by rules, never by the model.** The model sees evidence but its output has
+   no location field:
+   - `reported_coords` present → `EXACT`, `grid_cell = cell_for(coords)`, `resolved_coords = coords`.
+     Retrieval still runs, for evidence only; it cannot override GPS.
+   - otherwise → `location_confidence`, `grid_cell` and `resolved_coords` are copied verbatim from
+     `rag-index`'s `RetrievalResult`.
+   - `rag-index` unreachable or slow → `UNKNOWN`, `grid_cell = null`, `evidence = []`.
+4. **Budget.** Consumed → persisted ≤ 3s p95: retrieval timeout 300ms, model timeout 2.4s, leaving
+   ~300ms for persistence and publishing.
+5. **Idempotent on `report_id`.** If a `TriageResult` already exists for the report, the stored
+   outcome is re-published and the message acked — no second model call, no second row.
+6. **Guarded state change.** `UPDATE reports SET state = :new WHERE id = :id AND state = 'RECEIVED'`.
+   If a responder acknowledged the report first, the result is still stored and the state stays
+   `ACKNOWLEDGED`.
 
 ---
 
-## 4. Flow & Failure Paths
-
-### Primary Processing Sequence
+## 4. Flow
 
 ```mermaid
 sequenceDiagram
     autonumber
-    participant MQ as RabbitMQ (report.received)
-    participant C as Consumer / Worker
-    participant RAG as rag-index (HTTP)
-    participant CH as LangChain Triage Chain
+    participant MQ as RabbitMQ (report.received, quorum)
+    participant C as consumer
     participant DB as PostgreSQL
-    participant OUT as RabbitMQ (report.triaged / needs_review)
+    participant RAG as rag-index
+    participant CH as triage chain
+    participant OUT as RabbitMQ (exchange gridlock)
 
-    MQ->>C: Delivery: report.received payload
-    activate C
-
-    Note over C: Step 1: Context Retrieval
-    alt RAG service available
-        C->>RAG: POST /internal/rag/retrieve {query: description, limit: 3}
-        RAG-->>C: 200 OK [EvidenceChunk, ...]
-    else RAG timeout / unreachable
-        Note over C: Degrade gracefully (Non-negotiable 2)
-        C->>C: Set evidence = [], confidence = UNKNOWN, grid_cell = null
+    MQ->>C: deliver report.received
+    alt payload does not parse
+        C->>MQ: basic.reject(requeue=false) → gridlock.dlq
+    end
+    C->>DB: SELECT triage_results WHERE report_id = :id
+    alt already triaged (redelivery)
+        C->>OUT: re-publish stored outcome
+        C->>MQ: basic.ack
     end
 
-    Note over C: Step 2: Portable Chain Execution (Budget <= 2.5s)
-    C->>CH: invoke(TriageInput)
-    
-    alt Model returns valid Tier and Reason within budget
-        CH-->>C: TriageOutput(tier, reason)
-        Note over C: Validate enum: tier in {MONITOR, ADVISORY, URGENT, CRITICAL_DISPATCH}
-        C->>DB: INSERT TriageResult, UPDATE Report(state=TRIAGED)
-        C->>OUT: publish report.triaged {report_id, tier, grid_cell, ...}
-        C->>MQ: basic_ack(delivery_tag)
-    else Model times out (> 2.5s) or returns API error
-        Note over C: Graceful degradation to NEEDS_REVIEW
-        C->>DB: INSERT TriageResult(tier=null, failure_reason="LLM timeout / error"), UPDATE Report(state=NEEDS_REVIEW)
-        C->>OUT: publish report.needs_review {report_id, failure_reason, ...}
-        C->>MQ: basic_ack(delivery_tag)
-    else Model returns invalid tier token (coercion forbidden)
-        Note over C: Reject to NEEDS_REVIEW (Non-negotiable 1)
-        C->>DB: INSERT TriageResult(tier=null, failure_reason="Invalid tier: <raw>"), UPDATE Report(state=NEEDS_REVIEW)
-        C->>OUT: publish report.needs_review {report_id, failure_reason, ...}
-        C->>MQ: basic_ack(delivery_tag)
-    else DB persistence error
-        Note over C: Transient DB failure -> Nack & requeue (max 3 times)
-        C->>MQ: basic_nack(requeue=true)
+    alt reported_coords present
+        C->>C: EXACT, grid_cell = cell_for(coords)
     end
-    deactivate C
+    C->>RAG: POST /internal/rag/retrieve {description, reported_landmark} (timeout 300ms)
+    alt 200
+        RAG-->>C: RetrievalResult
+    else timeout / error
+        C->>C: evidence = [], UNKNOWN, grid_cell = null (unless EXACT)
+    end
+
+    C->>CH: atriage(TriageChainInput) (timeout 2.4s)
+    alt valid output
+        CH-->>C: TriageChainOutput(tier, reason)
+        C->>DB: BEGIN; INSERT triage_results (success shape); guarded UPDATE state → TRIAGED; COMMIT
+        C->>OUT: publish report.triaged (confirm)
+    else timeout or provider error
+        C->>DB: BEGIN; INSERT triage_results (failure shape, "model timeout/error: …"); guarded UPDATE → NEEDS_REVIEW; COMMIT
+        C->>OUT: publish report.needs_review (confirm)
+    else output fails validation
+        C->>DB: BEGIN; INSERT triage_results (failure shape, "invalid model output: <raw>"); guarded UPDATE → NEEDS_REVIEW; COMMIT
+        C->>OUT: publish report.needs_review (confirm)
+    end
+    alt DB or publish error
+        C->>MQ: basic.nack(requeue=true) — x-delivery-limit dead-letters after 3 attempts
+    else
+        C->>MQ: basic.ack
+    end
 ```
 
-### Detailed Failure Handling Matrix
+The order *commit → publish → ack* is what makes a crash safe without a second outbox: a crash
+before the ack means redelivery, and redelivery hits the idempotency branch, which re-publishes.
 
-| Failure Mode | Detection | System Action | Downstream Impact |
-|---|---|---|---|
-| `rag-index` connection error or timeout | HTTP client exception or timeout > 500ms | Catch exception, fallback to `evidence = []`, `location_confidence = UNKNOWN`, `grid_cell = null`. Reason explicitly notes landmark could not be verified. | Report is still triaged based on text content. No data loss. |
-| LLM API rate limit / 5xx / timeout (> 2.5s) | `asyncio.TimeoutError` or model provider exception | Catch exception, set `Report.state = NEEDS_REVIEW`, record error in `failure_reason`. Ack AMQP message immediately. | Surfaces immediately in responder console `Needs review` pane. No retry storm. |
-| Model hallucinates non-enum tier | Schema/Pydantic validation error | Catch validation error, set `Report.state = NEEDS_REVIEW`, record `failure_reason = "Unrecognized tier: {raw}"`. Ack AMQP message. | Responder manually assigns tier. Zero invented tiers reach dispatch. |
-| Database connection down | `psycopg` / DB driver error | `basic_nack(requeue=true)`. After 3 attempts, RabbitMQ DLX routes to `gridlock.dlq`. | Page-worthy alarm. Prevents message loss while DB recovers. |
-| Malformed JSON message on queue | JSON decode failure | Reject message to DLQ (`basic_reject(requeue=false)`). | Poison pill isolated; pipeline remains unblocked. |
+### Failure matrix
+
+| Failure | Detection | Action | Result |
+| --- | --- | --- | --- |
+| `rag-index` down or > 300ms | HTTP error / timeout | `evidence = []`, `UNKNOWN` (or `EXACT` if GPS) | Tier from text alone; the reason must not name a place |
+| Model error or > 2.4s | provider exception / `asyncio.TimeoutError` | Failure-shape result, `NEEDS_REVIEW`, ack | Visible in `Needs review` at once; no retry storm |
+| Invalid model output | parse/validation error | Failure-shape result with the raw output, `NEEDS_REVIEW`, ack | Zero invented tiers |
+| DB down | driver error | `nack(requeue=true)`; dead-lettered after 3 attempts | Page-worthy: a report is invisible while in the DLQ |
+| Malformed message | payload does not parse | `reject(requeue=false)` → DLQ | Poison message isolated |
+| Duplicate delivery | existing `TriageResult` | Re-publish stored outcome, ack | One row, one model call |
 
 ---
 
-## 5. State Machine
+## 5. State
 
-The states of `Report` touched by `triage-engine`:
+The `Report` transitions this service performs (domain-model §5 is the full machine):
 
 ```mermaid
 stateDiagram-v2
-    [*] --> RECEIVED : ingest-api
-    RECEIVED --> TRIAGED : valid tier assigned within budget
-    RECEIVED --> NEEDS_REVIEW : model error, timeout, or invalid tier
-    NEEDS_REVIEW --> TRIAGED : operator re-run / manual triage succeeds
+    RECEIVED --> TRIAGED : valid tier within budget
+    RECEIVED --> NEEDS_REVIEW : model error, timeout, or invalid output
 ```
 
-Any transition not drawn (such as `RECEIVED -> RESOLVED` directly or `TRIAGED -> RECEIVED`) is prohibited.
+`NEEDS_REVIEW → TRIAGED` (manual re-run) is drawn in the domain model but has no trigger yet
+(domain-model §10); this service does not perform it.
 
 ---
 
-## 6. Contracts & Chain Specification
+## 6. Contracts
 
-### 6.1 Portable Chain Signature (US6)
+### 6.1 The chain (US6)
 
-Per US6, the core triage chain module must depend **only** on LangChain abstractions, standard library, and Pydantic models. It must have **zero imports** from `fastapi`, `sqlalchemy`, `aio_pika`, or database drivers.
+`chain.py` imports only LangChain, Pydantic, the standard library and `gridlock_contracts`. No
+`fastapi`, `starlette`, `sqlalchemy`, `aio_pika` or `psycopg` may appear in its import graph.
 
 ```python
 # services/triage-engine/src/gridlock_triage/chain.py
 from typing import Protocol
 from pydantic import BaseModel, Field
 from gridlock_contracts.enums import Tier
+from gridlock_contracts.models import EvidenceChunk
 
 class TriageChainInput(BaseModel):
     description: str = Field(..., min_length=1, max_length=2000)
+    reported_landmark: str | None = None
     category_hint: str | None = None
-    evidence_text: str = ""
+    evidence: list[EvidenceChunk] = []
 
 class TriageChainOutput(BaseModel):
     tier: Tier
     reason: str = Field(..., min_length=5, max_length=500)
 
-class TriageChainProtocol(Protocol):
-    async def atriage(self, input_data: TriageChainInput) -> TriageChainOutput:
-        """Asynchronously executes triage prompt against configured LLM."""
+class TriageChain(Protocol):
+    model_id: str        # the exact model identifier sent to the provider; persisted as-is
+    prompt_version: str  # §6.2
+
+    async def atriage(self, data: TriageChainInput) -> TriageChainOutput:
+        """Raises InvalidModelOutput(raw: str) when the output does not parse."""
         ...
 ```
 
-### 6.2 Prompt File Format & Versioning
+Evidence reaches the prompt as one line per chunk — `- {text} (similarity {similarity:.2f})` — or
+the literal `none` when the list is empty. Formatting happens inside the chain.
 
-Prompts reside outside application code in versioned files:
-- **Location:** `services/triage-engine/prompts/triage_v1.prompt`
-- **Derivation of `prompt_version`:** A deterministic SHA-256 hash (first 12 hex characters) computed from the normalized UTF-8 prompt template text, prefixed by the base filename: e.g., `triage_v1:a8f9c2d10e4b`.
-- **Loading mechanism:** Loaded at service initialization. Any change to prompt file contents automatically yields a new `prompt_version` in all emitted `TriageResult` records.
+### 6.2 Prompt file and `prompt_version`
 
-#### Prompt Template Specification
+- **File:** `services/triage-engine/prompts/triage_v1.prompt`, a LangChain f-string template.
+- **`prompt_version`:** `"<file stem>:<first 12 hex chars of SHA-256 of the file's raw bytes>"`, e.g.
+  `triage_v1:3f09a1c2b7de`. Raw bytes, no normalisation — any change, including whitespace, is a new
+  version. `.gitattributes` pins the file to LF so the hash is the same on every clone.
+- Loaded once at startup.
+
+The template (the JSON braces are doubled because the file is an f-string template; single braces
+would make LangChain raise `KeyError` on the first call):
 
 ```text
-You are the GridLock safety triage engine for South African community reports.
-Evaluate the reported incident and classify it into EXACTLY ONE priority tier.
+You are the GridLock triage engine for community-safety reports in South Africa.
+Assign EXACTLY ONE tier using the rules below, in order. The first rule that matches decides.
 
-TIER DEFINITIONS:
-- CRITICAL_DISPATCH: Active, violent crime or imminent threat to life in progress (e.g. armed robbery, home invasion, active shooting, kidnapping, severe assault, structure fire with people trapped).
-- URGENT: Serious property crime in progress, burglary with suspects on site, domestic disturbance without weapons visible, suspicious persons attempting entry, violent crime occurred within past 15 minutes.
-- ADVISORY: Non-violent crime discovered after the fact (theft out of motor vehicle overnight, vandalism), suspicious activity without immediate threat (prowler seen earlier, suspicious lingering car), major physical hazard (open electrical box).
-- MONITOR: Non-urgent municipal complaints (noise complaints, streetlights out, illegal dumping, bylaws, stray pets).
+1. CRITICAL_DISPATCH — a threat to someone's life or body is happening now:
+   - forced entry into a home is in progress (a home invasion), whether or not the report says
+     anyone is inside — unless the report says the home is empty;
+   - a weapon is present at a crime in progress;
+   - someone is being assaulted, abducted or held now;
+   - a fire or other hazard is trapping people now.
+2. URGENT — a crime is in progress or has just happened, and rule 1 does not apply:
+   - a break-in in progress at a home the report says is empty, or at a non-residential property;
+   - suspects are on or at the property now, without a weapon mentioned;
+   - a violent crime happened and the suspects are still nearby.
+3. ADVISORY — no one is in danger now:
+   - a crime discovered after the fact (a car broken into overnight, a house found burgled);
+   - suspicious activity with no crime described (a car idling for hours, someone watching houses);
+   - a physical hazard with no one trapped (an open manhole, exposed electrical wiring).
+4. MONITOR — a nuisance or municipal matter: noise, streetlights, dumping, potholes, leaks, stray
+   animals.
 
-GROUNDING RULES:
-1. Base your classification ONLY on the provided report description and retrieved landmarks.
-2. Do NOT invent details, weapons, or severities not present in the text.
-3. Reason must be exactly ONE sentence summarizing the core factual justification.
+Never add a weapon, a victim, a suspect or a place that the report and the evidence do not
+contain. If the report is too vague to apply a rule, choose the lowest tier the text supports.
 
-REPORT DETAILS:
-Description: {description}
-Category Hint: {category_hint}
-Retrieved Landmark Evidence: {evidence_text}
+Report: {description}
+Landmark the reporter named: {reported_landmark}
+Category hint: {category_hint}
+Landmark evidence:
+{evidence}
 
-Respond in valid JSON matching this schema:
-{
-  "tier": "CRITICAL_DISPATCH" | "URGENT" | "ADVISORY" | "MONITOR",
-  "reason": "<One clear factual sentence justifying the tier>"
-}
+Reply with JSON only, exactly this shape, and a one-sentence reason quoting the report's own words:
+{{"tier": "CRITICAL_DISPATCH" | "URGENT" | "ADVISORY" | "MONITOR", "reason": "<one sentence>"}}
 ```
 
-### 6.3 Operational Tier Criteria Table
+### 6.3 Tier criteria
 
-To ensure consistency across human operators and AI runs:
+The prompt above **is** the criteria. There is deliberately no second table here that could drift
+from it. Worked examples, which become test cases (§9):
 
-| Tier | Operational Trigger | Typical Incidents | Prohibited Classifications |
-|---|---|---|---|
-| `CRITICAL_DISPATCH` | Immediate threat to human life or physical safety actively in progress. | Armed home invasion in progress; active gunfire; hostage / kidnapping; armed robbery with weapon brandished; severe physical assault happening now. | Break-in discovered after suspects left; threats made over text/phone; theft without weapons. |
-| `URGENT` | High-risk property crime in progress, or serious threat without confirmed deadly weapons, or recent violent crime (suspects nearby). | Suspects jumping wall into property; break-in in progress while house is unoccupied; street mugging just occurred 2 mins ago; trespassing with burglary tools. | Noise disturbance; stolen vehicle parked overnight; streetlight outage. |
-| `ADVISORY` | Past incidents without ongoing threat; suspicious circumstances without overt violence; public safety infrastructure hazards. | Car broken into overnight; house broken into earlier during the day; suspicious car idling without occupants for days; open stormwater drain. | Active screams for help; armed attackers on premises. |
-| `MONITOR` | Low-priority municipal, nuisance, or quality-of-life reports. | Late night loud music; dog barking; illegal dumping; water leak on verge; potholes. | Any report involving violence, threats, or active intruders. |
+| Report | Tier | Rule |
+| --- | --- | --- |
+| "men with a gun forcing my back door, I'm inside with my kids" | `CRITICAL_DISPATCH` | 1 (forced entry, home, weapon) |
+| "men breaking through my back gate, 14 Sisulu Street" | `CRITICAL_DISPATCH` | 1 (forced entry into a home in progress; occupancy not stated) |
+| "someone is breaking into the empty house next door, owners are overseas" | `URGENT` | 2 (home stated empty) |
+| "guys climbing into the spaza shop roof right now" | `URGENT` | 2 (non-residential, in progress) |
+| "my car window was smashed overnight, radio gone" | `ADVISORY` | 3 (after the fact) |
+| "streetlight out on the corner since Tuesday" | `MONITOR` | 4 |
 
 ---
 
 ## 7. Structure
 
-Files created or modified for `triage-engine`:
-
 | Path | New? | Responsibility |
-|---|---|---|
-| `services/triage-engine/pyproject.toml` | new | Pinned Python 3.13 dependencies (LangChain, pydantic, aio-pika, psycopg) |
-| `services/triage-engine/prompts/triage_v1.prompt` | new | Canonical prompt template file |
-| `services/triage-engine/src/gridlock_triage/__init__.py` | new | Package initialization |
-| `services/triage-engine/src/gridlock_triage/chain.py` | new | Pure LangChain chain implementation (no transport/storage imports) |
-| `services/triage-engine/src/gridlock_triage/prompt_loader.py` | new | File loader and SHA-256 `prompt_version` calculator |
-| `services/triage-engine/src/gridlock_triage/rag_client.py` | new | HTTP client for calling `rag-index` retrieval endpoint |
-| `services/triage-engine/src/gridlock_triage/repository.py` | new | PostgreSQL persistence for `TriageResult` and state updates |
-| `services/triage-engine/src/gridlock_triage/consumer.py` | new | RabbitMQ worker consuming `report.received` and publishing downstream |
-| `services/triage-engine/tests/test_chain_isolation.py` | new | AST / import-graph test enforcing US6 |
-| `services/triage-engine/tests/test_chain_logic.py` | new | Unit tests for prompt formatting, output parsing, and tier validation |
-| `services/triage-engine/tests/test_consumer.py` | new | Integration tests for worker flows, error fallbacks, and DLQ handling |
+| --- | --- | --- |
+| `services/triage-engine/pyproject.toml` | new | Pinned deps: LangChain, pydantic, aio-pika, psycopg, httpx, `gridlock-contracts` |
+| `services/triage-engine/prompts/triage_v1.prompt` | new | The template in §6.2 |
+| `services/triage-engine/src/gridlock_triage/chain.py` | new | The chain; transport- and storage-free |
+| `services/triage-engine/src/gridlock_triage/prompt_loader.py` | new | Loads the template, computes `prompt_version` |
+| `services/triage-engine/src/gridlock_triage/rag_client.py` | new | `POST /internal/rag/retrieve` with the 300ms timeout |
+| `services/triage-engine/src/gridlock_triage/repository.py` | new | Idempotency lookup, result insert, guarded state update |
+| `services/triage-engine/src/gridlock_triage/consumer.py` | new | The §4 flow |
+| `services/triage-engine/tests/test_chain_isolation.py` | new | US6 import-graph test |
+| `services/triage-engine/tests/test_chain_logic.py` | new | Prompt formatting, parsing, rejection, worked examples |
+| `services/triage-engine/tests/test_consumer.py` | new | Failure paths, idempotency, DLQ |
 
 ---
 
-## 8. Decisions & Alternatives
+## 8. Decisions and alternatives
 
 | Decision | Chosen | Rejected, and why |
-|---|---|---|
-| Portability boundary | LangChain primitives (`RunnableSequence`, `ChatPromptTemplate`) decoupled from transport | Direct HTTP calls to OpenAI/Anthropic SDKs. Rejected: brief mandates portability (Python MVP, possible future Java/Spring AI migration). |
-| Out-of-spec tier handling | Immediate rejection to `ReportState.NEEDS_REVIEW` | Tier coercion (e.g. mapping "HIGH" to "URGENT"). Rejected: coercing invents dispatch decisions that neither human nor system intended. |
-| Prompt versioning | SHA-256 hash of template file content | Manual semantic version strings in code. Rejected: manual versions drift when developers tweak prompts without updating strings. |
-| Model failure handling | Route to `NEEDS_REVIEW`, ack AMQP message | Requeueing message with exponential backoff. Rejected: prevents retry storm during API outages and ensures report is immediately visible to responders. |
-| Transport dependencies in chain | Strict zero-import policy enforced by AST test | Importing db models directly into chain. Rejected: violates US6 and makes unit testing require database mocks. |
+| --- | --- | --- |
+| Portability boundary | LangChain runnables behind a `TriageChain` protocol | Calling a provider SDK directly — the Python-now/Java-later portability is the reason LangChain is in the stack. |
+| Invalid tier | Reject to `NEEDS_REVIEW` | Mapping `"HIGH"` to `URGENT` invents a decision nobody made. |
+| Home break-in, occupancy unstated | `CRITICAL_DISPATCH` | `URGENT` until occupancy is confirmed: occupancy is almost never stated in a panicked report, so this would rank most real home invasions below dispatch — the exact failure GridLock exists to prevent. Only an explicit "empty" lowers it. |
+| One source of criteria | The prompt file | A criteria table beside the prompt: two lists drift, and the model only ever reads one of them. |
+| `prompt_version` | Hash of the file's raw bytes | Hand-written version strings drift when someone edits the prompt and forgets to bump them. |
+| Model failure | `NEEDS_REVIEW` and ack | Requeue with backoff: a provider outage becomes a retry storm while reports sit invisible. |
+| Crash between commit and publish | Commit → publish → ack, plus idempotent redelivery | A second outbox in this service: redelivery already gives the same guarantee. |
+| Location | Rules and `rag-index`, never the model | Asking the model where it happened invites the plausible-sounding suburb this system must never produce. |
+
+Deviations from the locked stack: none.
 
 ---
 
 ## 9. How this is verified
 
-1. **Import Graph Isolation Test (US6)**:
-   - A pytest test parses the AST of `gridlock_triage.chain` and asserts that none of `fastapi`, `starlette`, `sqlalchemy`, `aio_pika`, `psycopg`, or `requests` appear anywhere in imported modules.
-2. **Deterministic Tier Classification Tests**:
-   - Using a mock chat model, verify all 4 tiers parse correctly.
-   - Verify that invalid string outputs (e.g. `"HIGH"`, `"CRITICAL"`, `"URGENT!"`) raise validation errors and do not coerce.
-3. **Timeout & Failure Path Verification**:
-   - Simulate a 3.5s delay in LLM call; verify timeout triggers within 2.5s, `ReportState` becomes `NEEDS_REVIEW`, and AMQP message is acked.
-   - Simulate `rag-index` connection failure; verify chain proceeds with empty evidence and `location_confidence = UNKNOWN`.
-4. **Prompt Hash Immutability**:
-   - Changing one character in `triage_v1.prompt` alters `prompt_version` string.
+1. **Import graph (US6).** In a fresh subprocess, import `gridlock_triage.chain` and assert that no
+   module starting `fastapi`, `starlette`, `sqlalchemy`, `aio_pika` or `psycopg` is in
+   `sys.modules`. (Not `requests` — LangChain's own dependencies legitimately import it.)
+2. **Prompt formats.** Render the template with every variable set and with every optional one
+   `None`; assert no `KeyError` and that the JSON example survives with single braces.
+3. **Worked examples.** Each §6.3 row, with a stub model returning that tier, persists that tier;
+   the two US2 scenarios (armed intrusion → `CRITICAL_DISPATCH`, streetlight → `MONITOR`) run
+   against the real model in the seed-corpus evaluation.
+4. **No coercion.** Stub outputs `"HIGH"`, `"CRITICAL"`, `"URGENT!"`, `"urgent"` and non-JSON each
+   produce a failure-shape result containing the raw output, state `NEEDS_REVIEW`, message acked.
+5. **Timeouts.** A model stub that sleeps 3.5s → failure-shape result within 2.4s + ε, acked. A
+   `rag-index` stub that sleeps 1s → triage continues with `UNKNOWN` and empty evidence.
+6. **Grounding.** Reports naming places absent from the index → `grid_cell is None`, and the reason
+   contains no suburb or landmark name that is absent from both the description and the evidence.
+7. **GPS wins.** A report with coords and a landmark resolving elsewhere → `EXACT`, cell from coords.
+8. **Idempotency.** Deliver the same `report.received` twice → one `TriageResult`, one model call,
+   two `report.triaged` publishes.
+9. **Acknowledged first.** Acknowledge a `RECEIVED` report, then deliver it → result stored, state
+   still `ACKNOWLEDGED`.
+10. **DLQ.** With the DB down, a message is dead-lettered after exactly 3 deliveries.
+11. **Prompt hash.** Changing one byte of the prompt file changes `prompt_version`.
 
 ---
 
 ## 10. Open questions
 
-- None blocking Phase 1 or 2 implementation. Grounding criteria, failure paths, and contracts are fully specified.
+- [ ] **Which model.** Provider, model and its pinned identifier are not chosen. Needs a latency
+      check against the 2.4s timeout on the seed corpus before US2 ships.
+- [ ] **Seed report corpus.** The worked examples are hand-written. The real-model evaluation in §9.3
+      needs a corpus of realistic reports, including code-switched English/isiZulu/Sesotho/Afrikaans
+      text, labelled by a person against §6.2's rules.
+- [ ] **Manual re-run** of a `NEEDS_REVIEW` report — no trigger yet (domain-model §10).

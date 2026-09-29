@@ -1,27 +1,21 @@
 # Design — `rag-index`
 
-**Status:** `agreed` · **Owner:** Katlego (Gemini) · **Tasks:** `T005` ·
-**Spec:** [SPEC.md](../../SPEC.md) `US3` · **Domain Model:** [domain-model.md](domain-model.md)
+**Status:** `draft` (Phase 0 fixes under review) · **Owner:** Katlego (Gemini; revised by Claude) ·
+**Tasks:** `T005` · **Spec:** `US3` · **Domain model:** [domain-model.md](domain-model.md)
 
 ---
 
 ## 1. What this covers
 
-The `rag-index` service grounds incident triage in local South African geographic landmarks. Residents
-routinely report emergencies using vernacular landmarks ("by the Spar on Vilakazi", "near Eyethu Mall")
-rather than GPS coordinates or street numbers.
+`rag-index` turns the way people name places ("by the Spar on Vilakazi") into a grid cell — or
+refuses to. It:
 
-This service is responsible for:
-1. Ingesting, validating, and embedding a structured catalog of local landmarks from committed source data (`data/landmarks/`).
-2. Providing a low-latency, deterministic internal HTTP retrieval API (`POST /internal/rag/retrieve`) invoked by `triage-engine`.
-3. Executing the strict **`RESOLVED` / `AMBIGUOUS` / `UNKNOWN`** decision logic.
-4. Enforcing **Non-negotiable 1**: if a landmark query is sub-threshold or ambiguously matches multiple distinct geographic locations, `grid_cell` is strictly set to `null` to prevent hallucinated dispatches.
-5. Defining the empirical measurement protocol for calibrating the similarity cutoff on the seed dataset rather than guessing a threshold.
+1. Builds a landmark index from a committed dataset (`data/landmarks/`), with one rebuild command.
+2. Serves `POST /internal/rag/retrieve` to `triage-engine` and nobody else.
+3. Applies the `RESOLVED` / `AMBIGUOUS` / `UNKNOWN` rule, where both refusals mean `grid_cell = null`.
+4. Defines how the similarity threshold is **measured**. It does not pick one.
 
-It explicitly does **not** cover:
-- LLM triage reasoning or tier assignment (covered by `docs/design/triage.md`).
-- Multi-report corroboration or incident clustering (covered by `docs/design/verification.md`).
-- Resident HTTP report ingestion (covered by `docs/design/ingest.md`).
+It never sees GPS (`EXACT` is decided in `triage.md`), never assigns tiers, and never corroborates.
 
 ---
 
@@ -29,15 +23,18 @@ It explicitly does **not** cover:
 
 | Kind | Where |
 | --- | --- |
-| Shared domain model | [docs/design/domain-model.md](domain-model.md) §3 (`Landmark`, `EvidenceChunk`, `Coordinates`), §4 (flow), §10 (Open Questions 3 & 4) |
-| User story | [SPEC.md](../../SPEC.md) `US3` (ground triage in local landmarks) |
-| Architecture principles | [PLAN.md](../../PLAN.md) Non-negotiable 1 (grounded triage — never invent a location; ambiguous and unknown yield `grid_cell = null`) |
-| Spatial standard | Uber H3 Resolution 9 per [verification.md](verification.md) |
-| Embedding standard | `sentence-transformers/all-MiniLM-L6-v2` (384 dimensions, cosine distance) |
+| Shared domain model | [domain-model.md](domain-model.md) §3 (`Landmark`, `EvidenceChunk`), §6 (`RetrievalResult`, the retrieve endpoint), §10 (threshold, dataset) |
+| User story | `US3` (ground triage in local landmarks) |
+| Governing rule | Never invent a location. Sub-threshold and ambiguous matches both yield `grid_cell = null`, with evidence showing why. |
+| Cells | H3 res 9 via `gridlock_contracts.geo.cell_for` ([verification.md](verification.md) §6.3) |
+| Embedding model | `sentence-transformers/all-MiniLM-L6-v2`, 384 dimensions, cosine — provisional, §11 |
 
 ---
 
 ## 3. Domain model
+
+`Landmark`, `EvidenceChunk` and `RetrievalResult` are exactly domain-model §3/§6. The index row adds
+two storage-only columns that never leave this service.
 
 ```mermaid
 classDiagram
@@ -51,7 +48,12 @@ classDiagram
         +Coordinates coords
         +str grid_cell
         +str source
-        +List~float~ embedding
+    }
+
+    class LandmarkIndexRow {
+        +UUID landmark_id
+        +str chunk_text
+        +List~float~ embedding_384
     }
 
     class EvidenceChunk {
@@ -60,270 +62,259 @@ classDiagram
         +float similarity
     }
 
-    class Coordinates {
-        +float lat
-        +float lon
-    }
-
     class RetrievalResult {
         +LocationConfidence status
         +Optional~str~ grid_cell
         +Optional~Coordinates~ resolved_coords
         +List~EvidenceChunk~ evidence
-        +str explanation
     }
 
-    class LocationConfidence {
-        <<enumeration>>
-        EXACT
-        RESOLVED
-        AMBIGUOUS
-        UNKNOWN
-    }
-
+    Landmark "1" --> "1" LandmarkIndexRow : indexed as
     RetrievalResult "1" --> "0..*" EvidenceChunk : evidence
-    RetrievalResult "1" --> "1" LocationConfidence : status
-    RetrievalResult "1" --> "0..1" Coordinates : resolved_coords
     EvidenceChunk "1" --> "1" Landmark : cites
-    Landmark "1" --> "1" Coordinates : coords
 ```
 
-### Invariants & Inviolable Grounding Rules
+### Invariants
 
-1. **No Hallucinated Locations (Non-negotiable 1)**: Under no circumstances may `rag-index` assign a `grid_cell` or `resolved_coords` that does not originate from an exact GPS reading or a verified, unambiguous landmark match meeting the calibrated threshold.
-2. **Ambiguity Yields Null Cell**: If two or more distinct landmarks in different grid cells match a query with near-equal high confidence, `grid_cell` **must** be `null` and `status` **must** be `AMBIGUOUS`. Both evidence chunks are returned to the triage engine and responder console so human operators see the ambiguity.
-3. **Sub-Threshold Yields Null Cell**: If no landmark exceeds the calibrated similarity cutoff $T_{\text{match}}$, `grid_cell` **must** be `null`, `status` **must** be `UNKNOWN`, and `evidence` **must** be `[]`.
-4. **H3 Resolution 9 Uniformity**: All landmark coordinates are mapped to H3 Resolution 9 hex strings (`grid_cell`) upon dataset ingestion.
-5. **Deterministic Embedding**: Ingestion and query embedding utilize identical tokenization, normalization, and model weights (`all-MiniLM-L6-v2`).
+1. **Only a landmark can place a report.** `grid_cell` and `resolved_coords` in a `RESOLVED` result
+   are copied from the matched landmark. Nothing is interpolated, averaged or inferred.
+2. **Both refusals are null.** `AMBIGUOUS` and `UNKNOWN` carry `grid_cell = null` and
+   `resolved_coords = null`.
+3. **Evidence shows the reasoning.** `UNKNOWN` → `evidence = []`. `RESOLVED` → the matches above the
+   threshold (all in one cell). `AMBIGUOUS` → every match above the threshold, across all its cells,
+   so a responder sees each candidate.
+4. **Cells are computed, not typed.** A landmark's `grid_cell` is `cell_for(lat, lon)` at build time.
+   The dataset file has no `grid_cell` field to get wrong.
+5. **One threshold, measured, not overridable.** `RETRIEVAL_THRESHOLD` is a config value set from a
+   recorded calibration run (§6). The request cannot change it.
+6. **Same model both sides.** Index and query use the same pinned model revision; the build refuses
+   to run against an index built by a different revision.
+7. **`EvidenceChunk.text` is the chunk text exactly** as §5.2 builds it.
 
 ---
 
-## 4. Flow & Ambiguity Decision Tree
+## 4. Flow and the decision rule
 
-### 4.1 Retrieval Sequence
+### 4.1 Retrieval
 
 ```mermaid
 sequenceDiagram
     autonumber
     participant T as triage-engine
-    participant R as rag-index (/internal/rag/retrieve)
-    participant E as Local Embedding Model (all-MiniLM-L6-v2)
-    participant DB as PostgreSQL (pgvector)
+    participant R as rag-index
+    participant E as embedding model (in-process)
+    participant DB as PostgreSQL + pgvector
 
-    T->>R: POST /internal/rag/retrieve {query: description, limit: 3}
-    activate R
-
-    R->>E: embed_query(query) -> float[384]
-    E-->>R: vector
-
-    R->>DB: SELECT id, name, text, coords, grid_cell, 1 - (embedding <=> vector) AS similarity FROM landmarks ORDER BY similarity DESC LIMIT 3
-    DB-->>R: Top candidates [c1, c2, c3]
-
-    Note over R: Evaluate Decision Tree (Section 4.2)
-    alt Top similarity < T_match
-        Note over R: Status: UNKNOWN
-        R-->>T: 200 OK {status: "UNKNOWN", grid_cell: null, resolved_coords: null, evidence: []}
-    else Top candidate c1 >= T_match and Ambiguity detected (c2 >= T_match, |c1-c2| < 0.05, c1.cell != c2.cell)
-        Note over R: Status: AMBIGUOUS (SPEC US3 two same-named shops)
-        R-->>T: 200 OK {status: "AMBIGUOUS", grid_cell: null, resolved_coords: null, evidence: [c1, c2]}
-    else Top candidate c1 >= T_match and Unambiguous
-        Note over R: Status: RESOLVED
-        R-->>T: 200 OK {status: "RESOLVED", grid_cell: c1.grid_cell, resolved_coords: c1.coords, evidence: [c1]}
-    end
-    deactivate R
+    T->>R: POST /internal/rag/retrieve {description, reported_landmark?}
+    R->>R: query = reported_landmark if given, else description
+    R->>E: embed(query)
+    E-->>R: vector[384]
+    R->>DB: SELECT landmark_id, chunk_text, grid_cell, coords, 1 - (embedding <=> :v) AS similarity ORDER BY embedding <=> :v LIMIT 5
+    DB-->>R: top 5 candidates
+    R->>R: apply §4.2
+    R-->>T: 200 RetrievalResult
 ```
 
-### 4.2 The Decision Rule (Branching to `grid_cell = null`)
+The landmark the reporter typed is the better query when it exists: it is short and about a place,
+while a full description embeds mostly the incident ("men with a gun…") and matches landmarks
+weakly and unpredictably. When there is no landmark field, the description is the only signal and
+the threshold is what keeps a weak match from becoming a location.
+
+### 4.2 The decision rule
+
+`above` = candidates with `similarity ≥ RETRIEVAL_THRESHOLD`.
 
 ```mermaid
 flowchart TD
-    Start([Query Received]) --> Embed[Compute 384-d Embedding]
-    Embed --> QueryDB[Vector Cosine Search in pgvector]
-    QueryDB --> CheckTop{Top similarity s1 >= T_match ?}
-
-    CheckTop -- No --> Unknown[Status: UNKNOWN<br>grid_cell: null<br>resolved_coords: null<br>evidence: empty]
-    
-    CheckTop -- Yes --> CheckSecond{Second hit s2 >= T_match<br>AND s1 - s2 < Delta_ambiguity ?}
-    
-    CheckSecond -- No --> Resolved[Status: RESOLVED<br>grid_cell: c1.grid_cell<br>resolved_coords: c1.coords<br>evidence: c1]
-    
-    CheckSecond -- Yes --> CheckSameCell{c1.grid_cell == c2.grid_cell ?}
-    
-    CheckSameCell -- Yes --> ResolvedSame[Status: RESOLVED<br>grid_cell: c1.grid_cell<br>resolved_coords: c1.coords<br>evidence: c1, c2]
-    
-    CheckSameCell -- No --> Ambiguous[Status: AMBIGUOUS<br>grid_cell: null<br>resolved_coords: null<br>evidence: c1, c2]
+    Start([top 5 candidates]) --> Any{any candidate above the threshold?}
+    Any -- no --> Unknown[UNKNOWN<br>grid_cell null · resolved_coords null<br>evidence empty]
+    Any -- yes --> Cells{how many distinct grid_cells among them?}
+    Cells -- one --> Resolved[RESOLVED<br>grid_cell = that cell<br>resolved_coords = best match's coords<br>evidence = matches above threshold]
+    Cells -- two or more --> Ambiguous[AMBIGUOUS<br>grid_cell null · resolved_coords null<br>evidence = every match above threshold]
 
     classDef nullCell fill:#ffebee,stroke:#c62828,stroke-width:2px;
     classDef validCell fill:#e8f5e9,stroke:#2e7d32,stroke-width:2px;
     class Unknown,Ambiguous nullCell;
-    class Resolved,ResolvedSame validCell;
+    class Resolved validCell;
 ```
+
+There is no similarity-gap rule ("pick the top hit if it wins by Δ"). Two Shoprites differ in their
+chunk text by address and suburb, so their scores can differ by any amount for reasons unrelated to
+which one the reporter meant. A gap rule would resolve one of them some of the time, which is
+exactly the picked-first-hit behaviour US3 forbids. If calibration shows the rule above loses too
+much recall, a margin can be added — with its value measured by the same procedure, recorded in §8,
+never picked.
 
 ---
 
-## 5. Landmark Ingestion & Chunking Strategy
+## 5. Dataset and chunking
 
-### 5.1 Source Schema (`data/landmarks/pilot_area.jsonl`)
+### 5.1 Source schema — `data/landmarks/pilot_area.jsonl`
 
-The seed landmark dataset is committed directly to source control:
+One JSON object per line. The values below illustrate the shape and are **not** seed data; every
+real row must come from a named source.
 
 ```json
-{
-  "id": "7b89d4e5-6f1a-4d2b-9e3c-8f1a2b3c4d5e",
-  "name": "Spar Vilakazi",
-  "aliases": ["Spar Supermarket", "Vilakazi Spar"],
-  "category": "retail",
-  "address": "8242 Vilakazi Street",
-  "suburb": "Orlando West",
-  "lat": -26.2361,
-  "lon": 27.9068,
-  "grid_cell": "89196b26d83ffff",
-  "source": "OpenStreetMap + Local Ground Truth"
-}
+{"id": "7b89d4e5-6f1a-4d2b-9e3c-8f1a2b3c4d5e", "name": "Spar Vilakazi", "aliases": ["Vilakazi Spar"],
+ "category": "supermarket", "address": "Vilakazi Street", "suburb": "Orlando West",
+ "lat": -26.2361, "lon": 27.9068, "source": "<dataset name and licence>"}
 ```
 
-### 5.2 Chunk Generation
+The build rejects a row with an unknown field, a missing required field, or coordinates outside the
+pilot-area bounding box.
 
-Landmarks are discrete points of interest, not freeform text articles. Each landmark produces a single canonical textual chunk formatted for maximum semantic retrieval alignment with colloquial resident reports:
+### 5.2 Chunk text
 
-$$\text{Chunk Text} = \text{“}\{name\}\text{ (also known as }\{\text{aliases joined by commas}\}\text{), a }\{category\}\text{ at }\{address\}\text{ in }\{suburb\}\text{.”}$$
+One chunk per landmark:
 
-*Example:*
-> `"Spar Vilakazi (also known as Spar Supermarket, Vilakazi Spar), a retail store at 8242 Vilakazi Street in Orlando West."`
+```
+{name} ({aliases, comma-separated}) — {category}, {address}, {suburb}
+```
 
----
+The parenthesised part is omitted when there are no aliases. Example:
+`Spar Vilakazi (Vilakazi Spar) — supermarket, Vilakazi Street, Orlando West`.
 
-## 6. Threshold Calibration Procedure
+### 5.3 Rebuild
 
-**Non-negotiable 1 & SPEC US3 mandate that the similarity cutoff $T_{\text{match}}$ must be measured on the seed dataset, never guessed.** A guessed threshold produces false positives (hallucinated locations) or false negatives (missed locations).
-
-### Calibration Procedure (Executed in Phase 4 Task T040)
-
-1. **Benchmark Evaluation Corpus**:
-   - Construct a test dataset of **60 real-world query phrases**:
-     - 30 Positive queries referencing landmarks in the pilot area with colloquial spelling variations and prepositions (e.g. `"robbery at the spar on vilakazi"`, `"accident opposite eyethu mall"`, `"shots fired near hector pieterson museum"`).
-     - 15 Out-of-area / distractor queries referencing landmarks in other cities or non-existent landmarks (e.g. `"the spar in durban"`, `"break-in at sunninghill hospital"`, `"random shop on 5th avenue"`).
-     - 15 Ambiguous queries referencing common chain names without suburb disambiguators (e.g. `"steers"`, `"shoprite supermarket"`).
-2. **Threshold Parameter Sweep**:
-   - Sweep candidate thresholds $T \in [0.50, 0.95]$ with step size $0.02$.
-   - For each threshold $T$, compute:
-     - **False Acceptance Rate (FAR)**: $\frac{\text{Distractor queries accepted as RESOLVED}}{\text{Total distractor queries}}$.
-     - **Recall**: $\frac{\text{True positive queries correctly resolved}}{\text{Total positive queries}}$.
-     - **Ambiguity Precision**: $\frac{\text{Ambiguous queries correctly routed to AMBIGUOUS}}{\text{Total ambiguous queries}}$.
-3. **Selection Criterion**:
-   - **Target**: **$\text{FAR} = 0.0\%$**. Zero distractors may be resolved to a grid cell.
-   - Set $T_{\text{match}}$ to the lowest threshold where $\text{FAR} = 0.0\%$ while maximizing positive Recall.
-   - Set $\Delta_{\text{ambiguity}} = 0.06$ (calibrated against the difference between primary and secondary hits for identical chain stores).
-4. **Recording & Enforcement**:
-   - The measured threshold is recorded in `services/rag-index/config.py` as `RETRIEVAL_THRESHOLD` with a reference to the calibration test run.
+`uv run python -m gridlock_rag.build data/landmarks/pilot_area.jsonl` truncates and rebuilds the
+index in one transaction: validate every row, compute each cell with `cell_for`, build chunk text,
+embed, insert. Running it twice gives an identical index.
 
 ---
 
-## 7. Contracts & Endpoints
+## 6. Threshold calibration
 
-### 7.1 Internal HTTP Retrieval API
+Run once the pilot dataset exists, in the Phase 4 calibration task (not yet written — it is blocked
+on the dataset), and again whenever the dataset or model changes.
 
-`POST /internal/rag/retrieve`
+1. **Corpus.** Query phrases written the way reports are written, each labelled by a person with the
+   landmark it means, or `none`, or `ambiguous`:
+   - at least 60 that name a pilot-area landmark, with misspellings, prepositions and code-switched
+     English/isiZulu/Sesotho/Afrikaans phrasing ("eduze kwe-Spar e-Vilakazi");
+   - at least 100 that name no pilot-area landmark — other cities' landmarks, invented places, and
+     incident text with no place in it;
+   - at least 30 that name a chain with several pilot-area branches and no disambiguator.
+2. **Sweep.** For thresholds 0.30 to 0.95 in steps of 0.01, run the full §4.2 rule and record:
+   - **false placement rate** — `none` or `ambiguous` queries that came back `RESOLVED`, plus
+     landmark queries resolved to the *wrong* cell;
+   - **recall** — landmark queries resolved to the right cell;
+   - **ambiguity recall** — `ambiguous` queries that came back `AMBIGUOUS`.
+3. **Select.** The lowest threshold with a false placement rate of zero. With 100 negatives, "zero
+   observed" still allows a true rate up to about 3% (the rule of three), so the corpus sizes above
+   are minimums, not targets. If recall at that threshold is below 70%, stop and report it — that is
+   a finding about the dataset or model, not a reason to lower the bar.
+4. **Record.** `RETRIEVAL_THRESHOLD` goes in `services/rag-index/src/gridlock_rag/config.py` beside
+   the model revision and the path of the committed calibration report
+   (`services/rag-index/calibration/<date>.md`: corpus hash, the full sweep table, the choice).
 
-**Request Payload:**
+Until that run exists, the service **refuses to start**. There is no default threshold.
+
+---
+
+## 7. Contract
+
+`POST /internal/rag/retrieve` — exactly domain-model §6. No `limit`, no `threshold`: both are fixed
+by this service.
+
 ```json
-{
-  "query": "break-in at the Spar on Vilakazi",
-  "limit": 3,
-  "threshold": null
-}
+{"description": "break-in at the Spar on Vilakazi", "reported_landmark": null}
 ```
 
-**Response Payload (`RESOLVED`):**
+`RESOLVED`:
+
 ```json
 {
   "status": "RESOLVED",
-  "grid_cell": "89196b26d83ffff",
-  "resolved_coords": {
-    "lat": -26.2361,
-    "lon": 27.9068
-  },
+  "grid_cell": "89bcc3cc96bffff",
+  "resolved_coords": {"lat": -26.2361, "lon": 27.9068},
   "evidence": [
-    {
-      "landmark_id": "7b89d4e5-6f1a-4d2b-9e3c-8f1a2b3c4d5e",
-      "text": "Spar Vilakazi, a retail store at 8242 Vilakazi Street in Orlando West.",
-      "similarity": 0.8842
-    }
-  ],
-  "explanation": "Matched landmark 'Spar Vilakazi' in Orlando West above threshold."
+    {"landmark_id": "7b89d4e5-6f1a-4d2b-9e3c-8f1a2b3c4d5e",
+     "text": "Spar Vilakazi (Vilakazi Spar) — supermarket, Vilakazi Street, Orlando West",
+     "similarity": 0.81}
+  ]
 }
 ```
 
-**Response Payload (`AMBIGUOUS`):**
+`AMBIGUOUS` — two branches, two cells:
+
 ```json
 {
   "status": "AMBIGUOUS",
   "grid_cell": null,
   "resolved_coords": null,
   "evidence": [
-    {
-      "landmark_id": "11111111-1111-1111-1111-111111111111",
-      "text": "Shoprite Orlando, a supermarket at 12 Mooki Street in Orlando East.",
-      "similarity": 0.8410
-    },
-    {
-      "landmark_id": "22222222-2222-2222-2222-222222222222",
-      "text": "Shoprite Meadowlands, a supermarket at Ndaba Drive in Meadowlands.",
-      "similarity": 0.8250
-    }
-  ],
-  "explanation": "Multiple landmarks matched 'Shoprite' across distinct grid cells; cannot disambiguate."
+    {"landmark_id": "…", "text": "Shoprite Orlando — supermarket, …, Orlando East", "similarity": 0.78},
+    {"landmark_id": "…", "text": "Shoprite Meadowlands — supermarket, …, Meadowlands", "similarity": 0.76}
+  ]
 }
 ```
+
+`GET /health` → `200` once the model is loaded and the index is non-empty; `503` otherwise.
+Latency target: p95 ≤ 150ms, inside triage's 300ms timeout.
 
 ---
 
 ## 8. Structure
 
-Files created or modified in `services/rag-index`:
-
 | Path | New? | Responsibility |
-|---|---|---|
-| `services/rag-index/pyproject.toml` | new | Dependencies: FastAPI, uvicorn, sentence-transformers, pgvector, psycopg, h3 |
-| `services/rag-index/src/gridlock_rag/__init__.py` | new | Package initialization |
-| `services/rag-index/src/gridlock_rag/app.py` | new | FastAPI application exposing `/internal/rag/retrieve` and health |
-| `services/rag-index/src/gridlock_rag/embedder.py` | new | Encapsulates `all-MiniLM-L6-v2` tokenization and 384-d vector embedding |
-| `services/rag-index/src/gridlock_rag/retriever.py` | new | Vector search query execution and ambiguity decision logic |
-| `services/rag-index/src/gridlock_rag/ingest.py` | new | CLI script to parse `data/landmarks/*.jsonl`, compute H3 cells and embeddings, and populate PostgreSQL `landmarks` table |
-| `services/rag-index/src/gridlock_rag/calibrate.py` | new | Benchmark test suite executing the threshold calibration sweep |
-| `services/rag-index/tests/test_embedder.py` | new | Unit tests for deterministic embedding output and dimension shape |
-| `services/rag-index/tests/test_retriever_rules.py` | new | Unit tests verifying RESOLVED, AMBIGUOUS, and UNKNOWN decision rules |
+| --- | --- | --- |
+| `data/landmarks/pilot_area.jsonl` | new | The committed dataset (blocked on sourcing, §11) |
+| `services/rag-index/pyproject.toml` | new | Pinned deps: FastAPI, uvicorn, sentence-transformers (CPU torch), pgvector, psycopg, `gridlock-contracts` |
+| `services/rag-index/src/gridlock_rag/app.py` | new | `/internal/rag/retrieve`, `/health`; refuses to start without a calibrated threshold |
+| `services/rag-index/src/gridlock_rag/config.py` | new | Model name + pinned revision, `RETRIEVAL_THRESHOLD`, calibration report path |
+| `services/rag-index/src/gridlock_rag/embedder.py` | new | Loads the pinned model; `embed(text) -> list[float]` |
+| `services/rag-index/src/gridlock_rag/retriever.py` | new | Vector query + the §4.2 rule as a pure function |
+| `services/rag-index/src/gridlock_rag/build.py` | new | The §5.3 rebuild |
+| `services/rag-index/src/gridlock_rag/calibrate.py` | new | The §6 sweep, writing the report |
+| `services/rag-index/tests/test_decision_rule.py` | new | §4.2 on hand-built candidate lists |
+| `services/rag-index/tests/test_retrieval.py` | new | End-to-end against a small real index |
+| `services/rag-index/tests/test_build.py` | new | Validation, computed cells, idempotent rebuild |
 
 ---
 
-## 9. Decisions & Alternatives
+## 9. Decisions and alternatives
 
 | Decision | Chosen | Rejected, and why |
-|---|---|---|
-| Embedding execution | Local embedded `sentence-transformers/all-MiniLM-L6-v2` (384 dimensions) | External OpenAI/Cohere embedding API. Rejected: introduces network roundtrips, recurring cost, API rate limits, and breaks offline/local dev compose requirement. |
-| Vector database | PostgreSQL with `pgvector` extension | Separate vector DB (Chroma, Qdrant, Pinecone). Rejected: PostgreSQL 17 is already in the stack; `pgvector` eliminates an entire infrastructure container and allows unified transactions with PostGIS geometry. |
-| Cutoff selection | Measured empirical procedure on seed dataset | Hardcoded guess in code. Rejected: guessing violates Non-negotiable 1 and risks hallucinated dispatches. |
-| Ambiguity behavior | Nullify `grid_cell` and return all competing matches as evidence | Picking top hit arbitrarily. Rejected: dispatching to the wrong Shoprite when two exist is dangerous; responders must see the uncertainty. |
+| --- | --- | --- |
+| Ambiguity | Two or more cells above the threshold → `AMBIGUOUS` | A similarity-gap rule: resolves same-named shops by accident of wording (§4.2). |
+| Query text | The reporter's landmark field when present | Always the full description: it embeds the incident, not the place. |
+| Threshold override in the request | None | A caller-supplied threshold is a way around the one number keeping locations honest. |
+| Embeddings | Local model, in-process | A hosted embedding API: a network hop inside a 300ms budget, a per-report cost, and a failure mode unrelated to the index. |
+| Vector store | `pgvector` in the existing PostgreSQL | A separate vector database: one more container for a few thousand rows. |
+| Cells in the dataset | Computed at build time | Typed into the file: the first draft of this doc carried a hand-written cell that was wrong. |
+
+Deviations from the locked stack, recorded here: the `pgvector` extension in PostgreSQL, and
+`sentence-transformers`, which brings PyTorch into the `rag-index` image (CPU build only; the image
+size is to be measured in T012 against any size budget).
 
 ---
 
 ## 10. How this is verified
 
-1. **Deterministic Ambiguity Test (SPEC US3)**:
-   - Seed test database with two landmarks named "Shoprite" in different suburbs/cells.
-   - Query: `"robbery at the Shoprite"`.
-   - Assert `status == "AMBIGUOUS"`, `grid_cell is None`, `resolved_coords is None`, and `len(evidence) == 2`.
-2. **Deterministic Single-Hit Test (SPEC US3)**:
-   - Query: `"break-in at the Spar on Vilakazi"`.
-   - Assert `status == "RESOLVED"`, `grid_cell == "89196b26d83ffff"`, and `evidence[0].landmark_id` matches Spar.
-3. **Sub-Threshold / Distractor Test**:
-   - Query: `"emergency at Eiffel Tower"`.
-   - Assert `status == "UNKNOWN"`, `grid_cell is None`, and `evidence == []`.
-4. **Rebuild Script Idempotence**:
-   - Run `python -m gridlock_rag.ingest` on clean database; assert all landmarks indexed with correct H3 Resolution 9 cells.
+1. **Decision rule** — hand-built candidate lists: none above → `UNKNOWN`; several above in one cell
+   → `RESOLVED` with all of them as evidence; above in two cells → `AMBIGUOUS` with both. No
+   similarity values beyond the threshold influence the outcome.
+2. **US3 single hit** — a small real index containing the Spar row; query "break-in at the Spar on
+   Vilakazi" → `RESOLVED`, `grid_cell == cell_for(-26.2361, 27.9068)`, evidence cites the Spar.
+3. **US3 two Shoprites** — two Shoprite rows in different cells; "robbery at the Shoprite" →
+   `AMBIGUOUS`, `grid_cell is None`, both in evidence.
+4. **US3 not in index** — "emergency at the Eiffel Tower" → `UNKNOWN`, empty evidence.
+5. **Landmark field preferred** — description with no place + `reported_landmark` "Vilakazi Spar"
+   → resolves to the Spar.
+6. **No override** — a request with `threshold` or `limit` → `422`.
+7. **No threshold, no start** — the app refuses to start when `RETRIEVAL_THRESHOLD` is unset.
+8. **Rebuild** — running the build twice gives identical rows; a row with a bad field fails the
+   whole build.
 
 ---
 
 ## 11. Open questions
 
-- Pilot area landmark seed sourcing: the dataset for Soweto (Orlando West / East pilot) must be committed in `data/landmarks/pilot_area.jsonl` prior to Phase 4 (US3). The schema and ingestion engine are fully defined here.
+- [ ] **The pilot dataset** — which area, which source, which licence. US3 is blocked until it is
+      committed (domain-model §10).
+- [ ] **The embedding model's languages** — `all-MiniLM-L6-v2` was trained on English. Reports here
+      code-switch. The calibration corpus includes code-switched queries so the gap is *measured*;
+      if recall on them is poor, a multilingual model is the fix, chosen by rerunning §6 on each
+      candidate.
+- [ ] **Model revision** — the exact Hugging Face revision hash is recorded when the service is
+      scaffolded, and never floats.

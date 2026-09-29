@@ -1,23 +1,25 @@
 # Design — `ingest-api`
 
-**Status:** `agreed` · **Owner:** Kamo (Gemini) · **Tasks:** `T002` ·
-**Spec:** [SPEC.md](../../SPEC.md) `US1, US5` · **Domain Model:** [domain-model.md](domain-model.md)
+**Status:** `draft` (Phase 0 fixes under review) · **Owner:** Katlego (Gemini; revised by Claude) ·
+**Tasks:** `T002` · **Spec:** `US1`, `US5` · **Domain model:** [domain-model.md](domain-model.md)
 
 ---
 
 ## 1. What this covers
 
-The `ingest-api` service provides the front-door HTTP interface for GridLock. It is responsible for:
-1. Ingesting incident reports from residents via `POST /api/reports`, validating inputs, durably committing them to PostgreSQL, and returning a `202 Accepted` acknowledgement with a UUID reference in **≤ 200ms p95**.
-2. Providing a transactional **Outbox Pattern** that guarantees `report.received` messages reach RabbitMQ even if the broker is temporarily down or slow, ensuring the ack budget is never traded for broker availability.
-3. Providing the responder console queue endpoint (`GET /api/queue`) with deterministic ranking (Tier → Corroboration Count → Age), supporting filtering by active queue vs. needs-review group.
-4. Providing report detail lookups (`GET /api/reports/{id}`) and state transition actions (`POST /api/reports/{id}/acknowledge`).
+`ingest-api` is GridLock's front door. It:
 
-It explicitly does **not** cover:
-- LLM triage reasoning or tier assignment (covered by `docs/design/triage.md`).
-- Multi-report spatial verification (covered by `docs/design/verification.md`).
-- Mobile client offline caching or device GPS acquisition (covered by `docs/design/reporter-app.md`).
-- Web console frontend components (covered by `docs/design/responder-console.md`).
+1. Accepts reports on `POST /api/reports`, validates them, commits them to PostgreSQL and returns
+   `202` with a `report_id` in **≤ 200ms p95**, before any AI runs.
+2. Guarantees that `report.received` reaches RabbitMQ even when the broker is down, through a
+   transactional outbox — the ack is never traded for the publish.
+3. Serves the responder queue (`GET /api/queue`): the ranked `active` group and the `needs_review`
+   group, which also holds reports nobody has triaged yet.
+4. Serves report detail (`GET /api/reports/{id}`) and the acknowledge action.
+
+It does **not** cover triage (`triage.md`), corroboration (`verification.md`), the reporter app's
+offline queue and GPS handling (`reporter-app.md`), or the console's components
+(`responder-console.md`).
 
 ---
 
@@ -25,14 +27,17 @@ It explicitly does **not** cover:
 
 | Kind | Where |
 | --- | --- |
-| Shared domain model | [docs/design/domain-model.md](domain-model.md) §3 (`Report`, `Coordinates`, `QueueItem`), §4 (flow + failure table), §5 (state machine), §6 (HTTP + AMQP contracts) |
-| User stories | [SPEC.md](../../SPEC.md) `US1` (submit report and immediate ack), `US5` (responder queue) |
-| Architecture principles | [PLAN.md](../../PLAN.md) Non-negotiable 1 (grounded triage), 2 (never lose a report, persist before publish, ack before triage) |
+| Shared domain model | [domain-model.md](domain-model.md) §3 (`Report`, invariants), §4 (failure table), §5 (report lifecycle), §6 (HTTP + AMQP contracts, delivery semantics) |
+| User stories | `US1` (submit and get an immediate ack), `US5` (ranked responder queue) |
+| Governing rules | Never lose a report: persist before publish, ack before triage. Budgets: ack ≤ 200ms p95; submit → visible in the queue ≤ 5s. |
 | Schema contracts | `packages/contracts/gridlock_contracts/` (`Tier`, `ReportState`, `LocationConfidence`, `QueueItem`) |
 
 ---
 
 ## 3. Domain model
+
+`Report` and `QueueItem` are exactly as in domain-model §3/§6 and are imported from `contracts`,
+never re-declared. `OutboxEvent` is private to this service.
 
 ```mermaid
 classDiagram
@@ -53,10 +58,16 @@ classDiagram
         +str event_type
         +dict payload
         +OutboxStatus status
-        +int retry_count
+        +int attempt_count
         +datetime created_at
         +Optional~datetime~ published_at
         +Optional~str~ last_error
+    }
+
+    class OutboxStatus {
+        <<enumeration>>
+        PENDING
+        PUBLISHED
     }
 
     class Coordinates {
@@ -64,301 +75,306 @@ classDiagram
         +float lon
     }
 
-    class ReportState {
-        <<enumeration>>
-        RECEIVED
-        TRIAGED
-        NEEDS_REVIEW
-        ACKNOWLEDGED
-        RESOLVED
-    }
-
-    class OutboxStatus {
-        <<enumeration>>
-        PENDING
-        PUBLISHED
-        FAILED
-    }
-
-    class QueueItem {
-        +UUID report_id
-        +Optional~Tier~ tier
-        +Optional~str~ reason
-        +int corroboration_count
-        +Optional~str~ grid_cell
-        +LocationConfidence location_confidence
-        +ReportState state
-        +datetime received_at
-        +str description
-        +Optional~str~ failure_reason
-    }
-
     Report "1" --> "0..1" Coordinates : reported_coords
-    Report "1" --> "1" ReportState : lifecycle
+    Report "1" --> "1" OutboxEvent : announced by
     OutboxEvent "1" --> "1" OutboxStatus : status
 ```
 
-### Invariants & Storage Rules
+### Invariants
 
-1. **Immutable Description**: `description` is stored verbatim as submitted, without stripping, capitalization normalization, or spell-correction.
-2. **Server-Generated Timestamps**: `received_at` is generated by `ingest-api` at the moment of HTTP processing (`datetime.now(timezone.utc)`). Client timestamps are discarded to prevent clock skew attacks.
-3. **Transaction Boundary**: The insertion of `Report(state=RECEIVED)` and `OutboxEvent(event_type='report.received', status=PENDING)` occur within the **same single database transaction**. If the transaction commits, both exist; if it aborts, neither exists.
-4. **QueueItem Exclusivity**: In `QueueItem`, `tier` and `reason` are `None` if and only if `state == ReportState.NEEDS_REVIEW`.
+1. **Verbatim description.** `description` is stored exactly as submitted — no trimming, case
+   changes or spell-correction. Validation *reads* `description.strip()` to reject blank input but
+   never writes the stripped value.
+2. **Server time only.** `received_at` is set by `ingest-api` (`datetime.now(timezone.utc)`) when
+   the request is processed. The request has no timestamp field, so there is nothing to trust.
+3. **One transaction.** `INSERT Report(state=RECEIVED)` and `INSERT OutboxEvent(status=PENDING)`
+   commit together or not at all.
+4. **An outbox row is never given up on.** There is no `FAILED` status: a safety report that could
+   not be published keeps retrying. `attempt_count` and `last_error` exist for alerting — a
+   `PENDING` row older than 60s raises an alert — not for abandoning it.
 
 ---
 
-## 4. Flow & The Outbox Mechanism
+## 4. Flow and the outbox
 
-### 4.1 Ingestion Flow: Happy Path & Broker-Down Path
+### 4.1 Submit: happy path and broker-down path
 
-To satisfy the **≤ 200ms p95 ack budget** without sacrificing durability (Non-negotiable 2), `ingest-api` utilizes an inline fast-path publish with fallback to a background outbox sweep.
+The fast path publishes inline, so a healthy broker gets the message in milliseconds; the sweep is
+the guarantee. Both can publish the same row — that is accepted, because delivery is at-least-once
+and every consumer is idempotent on `report_id` (domain-model §6).
 
 ```mermaid
 sequenceDiagram
     autonumber
-    participant C as Reporter Client
-    participant API as ingest-api (FastAPI)
+    participant C as Reporter client
+    participant API as ingest-api
+    participant P as Publisher (long-lived channel)
     participant DB as PostgreSQL
-    participant MQ as RabbitMQ (Exchange: gridlock)
-    participant SW as Outbox Sweep Worker (Background)
+    participant MQ as RabbitMQ (exchange gridlock)
+    participant SW as Outbox sweep (background task)
 
     C->>API: POST /api/reports {description, coords?, landmark?, category_hint?}
-    activate API
-
-    Note over API: Step 1: In-Memory Validation (<= 2ms)
-    alt Description empty, whitespace, or > 2000 chars
-        API-->>C: 422 Unprocessable Entity
+    Note over API: Step 1 — validate (≤ 2ms)
+    alt description blank/whitespace or > 2000 chars, or bad coords
+        API-->>C: 422 (nothing persisted, nothing published)
     end
 
-    Note over API: Step 2: Atomic DB Commit (<= 25ms)
-    API->>DB: BEGIN TRANSACTION
-    API->>DB: INSERT INTO reports (id, description, state='RECEIVED', received_at=NOW(), ...)
-    API->>DB: INSERT INTO outbox (id, event_type='report.received', payload=json, status='PENDING')
-    API->>DB: COMMIT TRANSACTION
+    Note over API,DB: Step 2 — one transaction (≤ 35ms p95, 100ms statement timeout)
+    API->>DB: INSERT reports (state='RECEIVED', received_at=now)
+    API->>DB: INSERT outbox (event_type='report.received', status='PENDING')
+    API->>DB: COMMIT
 
-    Note over API: Step 3: Fast-Path Publish (Timeout <= 50ms)
-    alt RabbitMQ Healthy
-        API->>MQ: publish "report.received" (publisher confirm)
-        MQ-->>API: basic_ack
-        API->>DB: UPDATE outbox SET status='PUBLISHED', published_at=NOW() WHERE id=...
-        Note over API: Total elapsed <= 75ms
-        API-->>C: 202 Accepted {report_id, received_at}
-    else RabbitMQ Down / Slow / Connection Refused
-        Note over API: Graceful degradation: never block client (Non-negotiable 2)
-        API->>API: Catch AMQPError / Timeout (50ms)
-        Note over API: Outbox remains status='PENDING'. Total elapsed <= 80ms
-        API-->>C: 202 Accepted {report_id, received_at}
+    Note over API,MQ: Step 3 — fast-path publish (hard timeout 50ms)
+    API->>P: is the channel open?
+    alt channel open and confirm arrives within 50ms
+        P->>MQ: publish report.received (publisher confirm)
+        MQ-->>P: basic.ack
+        API->>DB: UPDATE outbox SET status='PUBLISHED', published_at=now WHERE id=:id AND status='PENDING'
+        API-->>C: 202 {report_id, received_at}
+    else channel closed, confirm times out, or AMQP error
+        Note over API: No reconnect attempt on the request path — reconnecting is the publisher's background job
+        API->>DB: UPDATE outbox SET attempt_count=attempt_count+1, last_error=:err WHERE id=:id
+        API-->>C: 202 {report_id, received_at}
     end
-    deactivate API
 
-    Note over SW,MQ: Step 4: Asynchronous Recovery Sweep (Runs every 1000ms)
-    loop Periodic Polling
-        SW->>DB: SELECT * FROM outbox WHERE status='PENDING' ORDER BY created_at ASC LIMIT 100 FOR UPDATE SKIP LOCKED
-        alt Pending events found and Broker restored
-            SW->>MQ: publish "report.received" (publisher confirm)
-            MQ-->>SW: basic_ack
-            SW->>DB: UPDATE outbox SET status='PUBLISHED', published_at=NOW()
+    Note over SW,MQ: Step 4 — sweep, every 1s
+    loop while the service runs
+        SW->>DB: SELECT … FROM outbox WHERE status='PENDING' AND created_at < now() - interval '2 seconds' ORDER BY created_at LIMIT 100 FOR UPDATE SKIP LOCKED
+        alt rows found and channel open
+            SW->>MQ: publish each (publisher confirm)
+            MQ-->>SW: basic.ack
+            SW->>DB: UPDATE outbox SET status='PUBLISHED', published_at=now
+        else broker still down
+            SW->>DB: UPDATE outbox SET attempt_count=attempt_count+1, last_error=:err
         end
     end
 ```
 
-### 4.2 Step-by-Step Ack Budget Breakdown (p95 Target ≤ 200ms)
+The sweep skips rows younger than 2s so that it does not normally race the fast path for a row the
+fast path is still publishing. That shrinks the duplicate window; it does not close it, and nothing
+depends on it being closed.
 
-| Sequence Step | Operation | p50 Duration | p95 Duration | Timeout Guard |
-|---|---|---|---|---|
-| Step 1 | Pydantic model validation & sanitization check | 0.5 ms | 2 ms | N/A |
-| Step 2 | Database connection pool checkout + `INSERT` Report & OutboxEvent + `COMMIT` | 12 ms | 35 ms | 100 ms statement timeout |
-| Step 3 | Fast-path `aio-pika` publish with publisher confirm | 5 ms | 20 ms | 50 ms hard timeout |
-| Step 3 (fallback) | Outbox catch on failure/timeout | 0.1 ms | 0.5 ms | Immediate return |
-| **Total** | **End-to-End HTTP Ack (POST to 202 response)** | **~18 ms** | **~60 ms** | **< 200 ms worst-case** |
+### 4.2 Ack budget (p95 ≤ 200ms)
 
-The 202 response is returned to the client before any background worker or downstream triage engine is invoked.
+| Step | Operation | p95 target | Guard |
+| --- | --- | --- | --- |
+| 1 | Pydantic validation | 2ms | — |
+| 2 | Pool checkout + two INSERTs + COMMIT | 35ms | 100ms statement timeout |
+| 3 | Channel check + publish + confirm | 20ms | 50ms hard timeout |
+| 3 | Outbox status UPDATE | 10ms | 100ms statement timeout |
+| — | **Total, POST → 202** | **≈ 70ms** | worst case with every guard hit ≈ 250ms, which is why each guard is a *timeout*, not a retry |
+
+The 202 is returned before the sweep or any downstream consumer runs. US1's measurement is taken
+with triage stopped.
 
 ---
 
-## 5. State Machine
+## 5. State
 
-`ingest-api` manages the initial insertion state and the responder lifecycle transitions:
+### 5.1 Report — the transitions `ingest-api` performs
+
+Domain-model §5 is the full machine. `ingest-api` performs only these:
 
 ```mermaid
 stateDiagram-v2
-    [*] --> RECEIVED : POST /api/reports (ingest-api)
-    RECEIVED --> TRIAGED : triage-engine (external)
-    RECEIVED --> NEEDS_REVIEW : triage-engine (external)
-    
+    [*] --> RECEIVED : POST /api/reports
+    RECEIVED --> ACKNOWLEDGED : POST /api/reports/{id}/acknowledge
     TRIAGED --> ACKNOWLEDGED : POST /api/reports/{id}/acknowledge
     NEEDS_REVIEW --> ACKNOWLEDGED : POST /api/reports/{id}/acknowledge
-    
-    ACKNOWLEDGED --> RESOLVED : POST /api/reports/{id}/resolve (future)
-    RESOLVED --> [*]
 ```
 
-### Transition Enforcement Rules
+`RESOLVED` has no endpoint yet (domain-model §10), so this service cannot reach it.
 
-- `POST /api/reports/{id}/acknowledge`:
-  - Allowed from `TRIAGED` or `NEEDS_REVIEW`.
-  - If current state is `ACKNOWLEDGED`, returns `409 Conflict` (`"Report is already acknowledged"`).
-  - If current state is `RESOLVED`, returns `409 Conflict` (`"Report is already resolved and cannot be modified"`).
-  - If current state is `RECEIVED`, allowed as an emergency override (`200 OK`).
+Acknowledge is one guarded statement, so two responders racing get one `200` and one `409`:
+
+```sql
+UPDATE reports SET state = 'ACKNOWLEDGED'
+ WHERE id = :id AND state IN ('RECEIVED', 'TRIAGED', 'NEEDS_REVIEW')
+RETURNING state;
+```
+
+No row returned → `404` if the id does not exist, otherwise `409` (it is `ACKNOWLEDGED` or
+`RESOLVED`).
+
+### 5.2 OutboxEvent
+
+```mermaid
+stateDiagram-v2
+    [*] --> PENDING : committed with its Report
+    PENDING --> PENDING : publish failed (attempt_count + 1)
+    PENDING --> PUBLISHED : broker confirm received
+    PUBLISHED --> [*]
+```
 
 ---
 
-## 6. Contracts & Endpoints
+## 6. Contracts
 
-### 6.1 HTTP Endpoints
+### 6.1 HTTP
 
-| Method | Path | Request Body | Response | Error Codes |
-|---|---|---|---|---|
-| `POST` | `/api/reports` | `ReportCreateRequest` | `202 Accepted`: `ReportCreateResponse` | `422` (validation failure) |
-| `GET` | `/api/queue` | Query params: `state: str = "active"`, `limit: int = 50`, `offset: int = 0` | `200 OK`: `QueueResponse` | `400` (invalid state query) |
-| `GET` | `/api/reports/{id}` | None | `200 OK`: `ReportDetail` | `404` (not found) |
-| `POST` | `/api/reports/{id}/acknowledge` | None | `200 OK`: `{"report_id": UUID, "state": "ACKNOWLEDGED"}` | `404`, `409` |
+Exactly domain-model §6; restated here with the codes this service returns.
 
-### 6.2 Verbatim Payloads (matching `domain-model.md` §6)
+| Method | Path | Request | Response |
+| --- | --- | --- | --- |
+| `POST` | `/api/reports` | `ReportCreateRequest` | `202 ReportCreateResponse` · `422` |
+| `GET` | `/api/queue` | `?state=active\|needs_review` (default `active`), `?limit=` 1..200 (default 50) | `200 {items: QueueItem[]}` · `422` on an unknown `state` or out-of-range `limit` |
+| `GET` | `/api/reports/{id}` | — | `200 ReportDetail` · `404` |
+| `POST` | `/api/reports/{id}/acknowledge` | — | `200 {state: "ACKNOWLEDGED"}` · `404` · `409` |
+
+### 6.2 Payloads
 
 ```python
-# Request & Response Schemas
-from uuid import UUID
 from datetime import datetime
-from pydantic import BaseModel, Field
-from gridlock_contracts.enums import Tier, ReportState, LocationConfidence
-
-class Coordinates(BaseModel):
-    lat: float = Field(..., ge=-90.0, le=90.0)
-    lon: float = Field(..., ge=-180.0, le=180.0)
+from typing import Literal
+from uuid import UUID
+from pydantic import BaseModel, ConfigDict, Field, field_validator
+from gridlock_contracts.models import Coordinates, QueueItem  # never re-declared here
 
 class ReportCreateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
     description: str = Field(..., min_length=1, max_length=2000)
     coords: Coordinates | None = None
     landmark: str | None = Field(None, max_length=200)
     category_hint: str | None = Field(None, max_length=100)
 
+    @field_validator("description")
+    @classmethod
+    def not_blank(cls, v: str) -> str:
+        if not v.strip():
+            raise ValueError("description is blank")
+        return v  # the original, unstripped — it is evidence
+
 class ReportCreateResponse(BaseModel):
     report_id: UUID
     received_at: datetime
 
-class QueueItem(BaseModel):
-    report_id: UUID
-    tier: Tier | None
-    reason: str | None
-    corroboration_count: int = Field(..., ge=1)
-    grid_cell: str | None
-    location_confidence: LocationConfidence
-    state: ReportState
-    received_at: datetime
-    description: str
-    failure_reason: str | None
-
 class QueueResponse(BaseModel):
     items: list[QueueItem]
-    total: int
+
+QueueState = Literal["active", "needs_review"]
 ```
 
-### 6.3 Queue Deterministic Ordering SQL Specification
+`ReportDetail` is the `QueueItem` fields plus `reported_coords`, `reported_landmark`,
+`category_hint`, `evidence`, `resolved_coords`, `incident_id`, `model_id` and `prompt_version` —
+every one a column that already exists in domain-model §3.
 
-When serving `GET /api/queue?state=active`, the SQL query must sort exactly as specified in SPEC US5:
+### 6.3 Queue queries
+
+`corroboration_count` is computed here, at read time, per domain-model §3 — there is no stored
+counter to read.
 
 ```sql
-SELECT 
-    r.id AS report_id,
-    tr.tier,
-    tr.reason,
-    COALESCE(tr.corroboration_count, 1) AS corroboration_count,
-    tr.grid_cell,
-    COALESCE(tr.location_confidence, 'UNKNOWN') AS location_confidence,
-    r.state,
-    r.received_at,
-    r.description,
-    tr.failure_reason
-FROM reports r
-LEFT JOIN triage_results tr ON tr.report_id = r.id
-WHERE r.state = 'TRIAGED'
-ORDER BY 
-    CASE tr.tier
-        WHEN 'CRITICAL_DISPATCH' THEN 1
-        WHEN 'URGENT'            THEN 2
-        WHEN 'ADVISORY'          THEN 3
-        WHEN 'MONITOR'           THEN 4
-        ELSE 5
-    END ASC,
-    tr.corroboration_count DESC,
-    r.received_at ASC
-LIMIT :limit OFFSET :offset;
+-- state=active: triaged, not yet taken — tier, then corroboration, then age
+SELECT r.id AS report_id, tr.tier, tr.reason,
+       CASE WHEN r.incident_id IS NULL THEN 1
+            ELSE (SELECT COUNT(*) FROM reports x WHERE x.incident_id = r.incident_id)
+       END AS corroboration_count,
+       tr.grid_cell, tr.location_confidence, r.state, r.received_at, r.description,
+       tr.failure_reason
+  FROM reports r
+  JOIN triage_results tr ON tr.report_id = r.id
+ WHERE r.state = 'TRIAGED'
+ ORDER BY CASE tr.tier WHEN 'CRITICAL_DISPATCH' THEN 1 WHEN 'URGENT' THEN 2
+                       WHEN 'ADVISORY' THEN 3 WHEN 'MONITOR' THEN 4 END,
+          corroboration_count DESC,
+          r.received_at ASC
+ LIMIT :limit;
+
+-- state=needs_review: failed triage, plus anything still untriaged after the 5s budget
+SELECT r.id AS report_id, NULL AS tier, NULL AS reason,
+       CASE WHEN r.incident_id IS NULL THEN 1
+            ELSE (SELECT COUNT(*) FROM reports x WHERE x.incident_id = r.incident_id)
+       END AS corroboration_count,
+       tr.grid_cell, COALESCE(tr.location_confidence, 'UNKNOWN') AS location_confidence,
+       r.state, r.received_at, r.description,
+       COALESCE(tr.failure_reason, 'not yet triaged') AS failure_reason
+  FROM reports r
+  LEFT JOIN triage_results tr ON tr.report_id = r.id
+ WHERE r.state = 'NEEDS_REVIEW'
+    OR (r.state = 'RECEIVED' AND r.received_at < now() - interval '5 seconds')
+ ORDER BY r.received_at ASC
+ LIMIT :limit;
 ```
 
-When query param `state=needs_review` is provided, the query filters by `r.state = 'NEEDS_REVIEW'` ordered by `r.received_at ASC`.
+Indexes: `reports (state, received_at)`, `reports (incident_id)`, `triage_results (report_id)` unique.
 
-### 6.4 AMQP Publication Contract
+### 6.4 AMQP publication
 
-- **Exchange**: `gridlock` (topic, durable)
-- **Routing Key**: `report.received`
-- **Payload**:
-  ```json
-  {
-    "report_id": "UUID string",
-    "description": "verbatim text",
-    "reported_coords": {"lat": -26.2041, "lon": 28.0473} | null,
-    "reported_landmark": "text" | null,
-    "category_hint": "text" | null,
-    "received_at": "2026-09-29T12:00:00.000000Z"
-  }
-  ```
+Routing key `report.received` on exchange `gridlock`; payload exactly as domain-model §6:
+
+```json
+{
+  "report_id": "UUID string",
+  "description": "verbatim text",
+  "reported_coords": {"lat": -26.2361, "lon": 27.9068},
+  "reported_landmark": "text or null",
+  "category_hint": "text or null",
+  "received_at": "2026-09-29T12:00:00.000000Z"
+}
+```
+
+`reported_coords` is `null` when the request had none.
 
 ---
 
 ## 7. Structure
 
-Files created or modified in `services/ingest-api`:
-
 | Path | New? | Responsibility |
-|---|---|---|
-| `services/ingest-api/pyproject.toml` | new | Dependencies: FastAPI, uvicorn, aio-pika, psycopg, pydantic |
-| `services/ingest-api/src/gridlock_ingest/__init__.py` | new | Package initialization |
-| `services/ingest-api/src/gridlock_ingest/app.py` | new | FastAPI application lifecycle, middleware, error handlers |
-| `services/ingest-api/src/gridlock_ingest/database.py` | new | Database connection pool management |
-| `services/ingest-api/src/gridlock_ingest/repository.py` | new | SQL queries for Reports, Outbox, and Queue projection |
-| `services/ingest-api/src/gridlock_ingest/publisher.py` | new | `aio-pika` connection manager and message publisher |
-| `services/ingest-api/src/gridlock_ingest/outbox.py` | new | Background worker task sweeping and recovering pending outbox events |
-| `services/ingest-api/src/gridlock_ingest/routes/reports.py` | new | `POST /api/reports`, `GET /api/reports/{id}`, acknowledge action |
-| `services/ingest-api/src/gridlock_ingest/routes/queue.py` | new | `GET /api/queue` with ordering and filtering |
-| `services/ingest-api/tests/test_ingest.py` | new | Unit and integration tests for report intake and validation |
-| `services/ingest-api/tests/test_outbox_resilience.py` | new | Broker-down and recovery sweep verification tests |
-| `services/ingest-api/tests/test_queue_ranking.py` | new | Ordering and tie-breaking tests for the queue endpoint |
+| --- | --- | --- |
+| `services/ingest-api/pyproject.toml` | new | Pinned deps: FastAPI, uvicorn, aio-pika, psycopg, pydantic, `gridlock-contracts` |
+| `services/ingest-api/src/gridlock_ingest/app.py` | new | App lifecycle: starts the publisher and the outbox sweep, error handlers |
+| `services/ingest-api/src/gridlock_ingest/database.py` | new | Connection pool |
+| `services/ingest-api/src/gridlock_ingest/repository.py` | new | Report + outbox inserts, guarded acknowledge, the two queue queries |
+| `services/ingest-api/src/gridlock_ingest/publisher.py` | new | One long-lived channel with confirms; reconnects in the background, never on a request |
+| `services/ingest-api/src/gridlock_ingest/outbox.py` | new | The sweep task |
+| `services/ingest-api/src/gridlock_ingest/routes/reports.py` | new | `POST /api/reports`, `GET /api/reports/{id}`, acknowledge |
+| `services/ingest-api/src/gridlock_ingest/routes/queue.py` | new | `GET /api/queue` |
+| `services/ingest-api/tests/test_ingest.py` | new | Validation, persistence, ack budget |
+| `services/ingest-api/tests/test_outbox_resilience.py` | new | Broker-down, recovery, duplicate-publish tolerance |
+| `services/ingest-api/tests/test_queue.py` | new | Ordering at every tie, the needs-review group, acknowledge races |
 
 ---
 
-## 8. Decisions & Alternatives
+## 8. Decisions and alternatives
 
 | Decision | Chosen | Rejected, and why |
-|---|---|---|
-| Broker-down resiliency | Transactional Outbox Pattern | Immediate AMQP publish without outbox. Rejected: if broker is unreachable, reports would either 500 (losing reports) or fail silently (dropping messages). |
-| Outbox delivery trigger | Dual mechanism: fast-path inline publish + background sweep fallback | Background-only polling. Rejected: polling alone introduces a fixed 1s latency on every report; fast-path gives <20ms latency when broker is up. |
-| Ingestion ack timing | Ack immediately upon DB commit before triage | Synchronous triage before ack. Rejected: LLM p95 is ~3s and external APIs can fail; resident on 2G phone needs instant confirmation. |
-| Queue rendering method | Direct SQL sorting with compound index | In-memory sorting. Rejected: in-memory sorting breaks pagination and creates race conditions across multi-instance API deployments. |
+| --- | --- | --- |
+| Broker-down durability | Transactional outbox | Publish-only: a dead broker means either a 5xx (report lost to the reporter) or a silently dropped message. |
+| Outbox trigger | Inline fast path + 1s sweep | Sweep only: adds up to 1s to every report on the happy path, eating the 5s end-to-end budget. |
+| Duplicate publishes | Accepted; consumers idempotent | Exactly-once via distributed locking between fast path and sweep: more moving parts to protect a property the consumers can provide cheaply. |
+| Giving up on a row | Never (`FAILED` removed) | A terminal failed state for an unpublished safety report is a report lost with extra steps. |
+| Untriaged reports | Shown in `needs_review` after 5s, by query | A sweeper writing a `STALE` state — a second process that can itself be down. |
+| Corroboration in the queue | `COUNT(*)` at read time | Reading a stored counter the verifier maintains: it can drift from the rows it claims to count. |
+| Pagination | `limit` only | `offset`/`total`: not in the agreed contract, and a queue of open safety reports is read from the top. Add via domain-model first if a real need appears. |
+
+Deviations from the locked stack: none.
 
 ---
 
 ## 9. How this is verified
 
-1. **Ack Budget Verification (< 200ms p95)**:
-   - Benchmark test executing 100 consecutive requests to `POST /api/reports` with a healthy database; assert p95 response time is ≤ 200ms.
-2. **Broker-Down Resilience Test**:
-   - In a test environment, shut down or sever connections to RabbitMQ.
-   - Execute `POST /api/reports` with a valid payload.
-   - Assert HTTP response is `202 Accepted` with a valid UUID.
-   - Assert database row exists in `reports` with `state = 'RECEIVED'`.
-   - Assert database row exists in `outbox` with `status = 'PENDING'`.
-   - Restore RabbitMQ connection and trigger `outbox_sweep()`.
-   - Assert message is consumed from `report.received` and outbox row transitions to `PUBLISHED`.
-3. **Queue Sorting Verification (US5)**:
-   - Seed database with reports representing all 4 tiers, mixed corroboration counts (1, 3, 5), and mixed submission timestamps.
-   - Call `GET /api/queue`.
-   - Assert order strictly matches: CRITICAL_DISPATCH first, then URGENT, then ADVISORY, then MONITOR; within each tier, highest corroboration count first; within same count, oldest `received_at` first.
-4. **Validation Guardrails**:
-   - Blank string, whitespace-only, and 2001-character string payloads return `422 Unprocessable Entity`.
+1. **Ack budget (US1).** 100 sequential valid submits with triage stopped; p95 of POST → 202 ≤ 200ms.
+2. **Broker down (US1).** Stop RabbitMQ; submit; assert `202`, a `RECEIVED` report and a `PENDING`
+   outbox row. Start RabbitMQ; within 5s assert the message is on the triage queue and the row is
+   `PUBLISHED`.
+3. **No reconnect on the request path.** With the broker down, 20 submits each complete in ≤ 200ms.
+4. **Duplicate publish tolerated.** Force the fast path and the sweep to publish the same row; assert
+   two messages and no error — idempotency is proved on the consumer side (`triage.md` §9).
+5. **Validation.** Empty, whitespace-only and 2001-character descriptions, and an unknown field, each
+   return `422` with no report and no outbox row. A description with leading spaces is stored with
+   them.
+6. **Queue ordering (US5).** Seed all four tiers with corroboration counts 1/3/5 and staggered times;
+   assert tier → count → age at every tie, including US5's three-report scenario.
+7. **Needs review holds untriaged reports.** A `RECEIVED` report 6s old appears in `needs_review`
+   with `failure_reason = "not yet triaged"`; one 2s old does not appear in either group.
+8. **Acknowledge.** From `RECEIVED`, `TRIAGED`, `NEEDS_REVIEW` → `200`; from `ACKNOWLEDGED` or
+   `RESOLVED` → `409`; unknown id → `404`; two concurrent calls → exactly one `200`.
 
 ---
 
 ## 10. Open questions
 
-- None. All endpoint contracts, budget allocations, and failure recovery sequences are fully defined.
+- [ ] **Resolve action** — `ACKNOWLEDGED → RESOLVED` has no endpoint. Decided with the console
+      (domain-model §10).
+- [ ] **Outbox alert destination** — "a `PENDING` row older than 60s raises an alert" needs
+      somewhere to send it. Belongs with `infra` (T012).
