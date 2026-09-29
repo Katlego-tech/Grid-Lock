@@ -15,7 +15,8 @@
    transactional outbox — the ack is never traded for the publish.
 3. Serves the responder queue (`GET /api/queue`): the ranked `active` group and the `needs_review`
    group, which also holds reports nobody has triaged yet.
-4. Serves report detail (`GET /api/reports/{id}`) and the acknowledge action.
+4. Serves report detail (`GET /api/reports/{id}`) and the two acknowledge actions — one report,
+   or every open report in an incident.
 
 It does **not** cover triage (`triage.md`), corroboration (`verification.md`), the reporter app's
 offline queue and GPS handling (`reporter-app.md`), or the console's components
@@ -184,6 +185,9 @@ stateDiagram-v2
     NEEDS_REVIEW --> ACKNOWLEDGED : POST /api/reports/{id}/acknowledge
 ```
 
+`POST /api/incidents/{id}/acknowledge` performs the same transitions for every open report in the
+incident, in one statement — it is not a new transition.
+
 `RESOLVED` has no endpoint yet (domain-model §10), so this service cannot reach it.
 
 Acknowledge is one guarded statement, so two responders racing get one `200` and one `409`:
@@ -196,6 +200,17 @@ RETURNING state;
 
 No row returned → `404` if the id does not exist, otherwise `409` (it is `ACKNOWLEDGED` or
 `RESOLVED`).
+
+The incident version is the same statement over the incident's reports, so a card is one action
+that either takes everything still open or reports that someone else already did:
+
+```sql
+UPDATE reports SET state = 'ACKNOWLEDGED'
+ WHERE incident_id = :incident_id AND state IN ('RECEIVED', 'TRIAGED', 'NEEDS_REVIEW')
+RETURNING id;
+```
+
+No rows → `404` if the incident does not exist, otherwise `409`.
 
 ### 5.2 OutboxEvent
 
@@ -221,6 +236,7 @@ Exactly domain-model §6; restated here with the codes this service returns.
 | `GET` | `/api/queue` | `?state=active\|needs_review` (default `active`), `?limit=` 1..200 (default 50) | `200 {items: QueueItem[]}` · `422` on an unknown `state` or out-of-range `limit` |
 | `GET` | `/api/reports/{id}` | — | `200 ReportDetail` · `404` |
 | `POST` | `/api/reports/{id}/acknowledge` | — | `200 {state: "ACKNOWLEDGED"}` · `404` · `409` |
+| `POST` | `/api/incidents/{id}/acknowledge` | — | `200 {state: "ACKNOWLEDGED", report_ids: UUID[]}` · `404` · `409` |
 
 ### 6.2 Payloads
 
@@ -256,7 +272,7 @@ QueueState = Literal["active", "needs_review"]
 ```
 
 `ReportDetail` is the `QueueItem` fields plus `reported_coords`, `reported_landmark`,
-`category_hint`, `evidence`, `resolved_coords`, `incident_id`, `model_id` and `prompt_version` —
+`category_hint`, `evidence`, `resolved_coords`, `model_id` and `prompt_version` —
 every one a column that already exists in domain-model §3.
 
 ### 6.3 Queue queries
@@ -265,24 +281,36 @@ every one a column that already exists in domain-model §3.
 counter to read.
 
 ```sql
--- state=active: triaged, not yet taken — tier, then corroboration, then age
-SELECT r.id AS report_id, tr.tier, tr.reason,
-       CASE WHEN r.incident_id IS NULL THEN 1
-            ELSE (SELECT COUNT(*) FROM reports x WHERE x.incident_id = r.incident_id)
-       END AS corroboration_count,
-       tr.grid_cell, tr.location_confidence, r.state, r.received_at, r.description,
-       tr.failure_reason
-  FROM reports r
-  JOIN triage_results tr ON tr.report_id = r.id
- WHERE r.state = 'TRIAGED'
- ORDER BY CASE tr.tier WHEN 'CRITICAL_DISPATCH' THEN 1 WHEN 'URGENT' THEN 2
-                       WHEN 'ADVISORY' THEN 3 WHEN 'MONITOR' THEN 4 END,
-          corroboration_count DESC,
-          r.received_at ASC
- LIMIT :limit;
+-- state=active: triaged, not yet taken, grouped by incident (domain-model §6 "Queue grouping")
+WITH open AS (
+  SELECT r.id AS report_id, r.incident_id, tr.tier, tr.reason, tr.grid_cell,
+         tr.location_confidence, r.state, r.received_at, r.description, tr.failure_reason,
+         COALESCE(r.incident_id, r.id) AS group_id,
+         CASE tr.tier WHEN 'CRITICAL_DISPATCH' THEN 1 WHEN 'URGENT' THEN 2
+                      WHEN 'ADVISORY' THEN 3 WHEN 'MONITOR' THEN 4 END AS tier_rank,
+         CASE WHEN r.incident_id IS NULL THEN 1
+              ELSE (SELECT COUNT(*) FROM reports x WHERE x.incident_id = r.incident_id)
+         END AS corroboration_count
+    FROM reports r
+    JOIN triage_results tr ON tr.report_id = r.id
+   WHERE r.state = 'TRIAGED'
+), keyed AS (
+  SELECT o.*, MIN(tier_rank)   OVER g AS group_tier,
+              MIN(received_at) OVER g AS group_oldest
+    FROM open o WINDOW g AS (PARTITION BY group_id)
+), ranked AS (
+  SELECT k.*, DENSE_RANK() OVER (ORDER BY group_tier, corroboration_count DESC,
+                                          group_oldest, group_id) AS group_rank
+    FROM keyed k
+)
+SELECT report_id, incident_id, tier, reason, corroboration_count, grid_cell,
+       location_confidence, state, received_at, description, failure_reason
+  FROM ranked
+ WHERE group_rank <= :limit
+ ORDER BY group_rank, tier_rank, received_at;
 
 -- state=needs_review: failed triage, plus anything still untriaged after the 5s budget
-SELECT r.id AS report_id, NULL AS tier, NULL AS reason,
+SELECT r.id AS report_id, r.incident_id, NULL AS tier, NULL AS reason,
        CASE WHEN r.incident_id IS NULL THEN 1
             ELSE (SELECT COUNT(*) FROM reports x WHERE x.incident_id = r.incident_id)
        END AS corroboration_count,
@@ -329,6 +357,7 @@ Routing key `report.received` on exchange `gridlock`; payload exactly as domain-
 | `services/ingest-api/src/gridlock_ingest/publisher.py` | new | One long-lived channel with confirms; reconnects in the background, never on a request |
 | `services/ingest-api/src/gridlock_ingest/outbox.py` | new | The sweep task |
 | `services/ingest-api/src/gridlock_ingest/routes/reports.py` | new | `POST /api/reports`, `GET /api/reports/{id}`, acknowledge |
+| `services/ingest-api/src/gridlock_ingest/routes/incidents.py` | new | `POST /api/incidents/{id}/acknowledge` |
 | `services/ingest-api/src/gridlock_ingest/routes/queue.py` | new | `GET /api/queue` |
 | `services/ingest-api/tests/test_ingest.py` | new | Validation, persistence, ack budget |
 | `services/ingest-api/tests/test_outbox_resilience.py` | new | Broker-down, recovery, duplicate-publish tolerance |
@@ -366,9 +395,14 @@ Deviations from the locked stack: none.
    them.
 6. **Queue ordering (US5).** Seed all four tiers with corroboration counts 1/3/5 and staggered times;
    assert tier → count → age at every tie, including US5's three-report scenario.
-7. **Needs review holds untriaged reports.** A `RECEIVED` report 6s old appears in `needs_review`
+7. **Grouping.** An incident whose open reports are `URGENT` and `ADVISORY` ranks as `URGENT`, its
+   reports come back contiguous with the `URGENT` one first, and `limit=1` returns the whole
+   incident, not one report of it.
+8. **Incident acknowledge.** Acknowledges every open report in one call; a second call → `409`; a
+   report acknowledged on its own beforehand is left alone and not in `report_ids`.
+9. **Needs review holds untriaged reports.** A `RECEIVED` report 6s old appears in `needs_review`
    with `failure_reason = "not yet triaged"`; one 2s old does not appear in either group.
-8. **Acknowledge.** From `RECEIVED`, `TRIAGED`, `NEEDS_REVIEW` → `200`; from `ACKNOWLEDGED` or
+10. **Acknowledge.** From `RECEIVED`, `TRIAGED`, `NEEDS_REVIEW` → `200`; from `ACKNOWLEDGED` or
    `RESOLVED` → `409`; unknown id → `404`; two concurrent calls → exactly one `200`.
 
 ---
