@@ -284,10 +284,11 @@ Deviations from the locked stack: none.
 
 ## 10. Open questions
 
-- [ ] **Grid cell scheme** — H3 (resolution 9, ~0.1 km²) vs. a plain geohash prefix. H3's uniform
+- [x] ~~**Grid cell scheme** — H3 (resolution 9, ~0.1 km²) vs. a plain geohash prefix. H3's uniform
       adjacency is worth a dependency if US4's boundary rule needs neighbours; geohash is simpler and
-      has no library. Decide in `verification.md` (T004) **before** T004's
-      implementation tasks are written; `grid_cell` is typed `str` here so either fits.
+      has no library.~~ **Decided in `verification.md` (T004):** Adopted Uber H3 Resolution 9
+      (~0.105 km², 15-character hex string) for uniform 6-neighbor adjacency and boundary stability
+      without cliff distortion.
 - [ ] **Corroboration window** — 15 minutes is written into SPEC US4 as a starting value, not a
       researched one. Needs a sanity check against how neighbourhood-watch reporting actually
       bursts before US4 ships.
