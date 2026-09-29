@@ -113,11 +113,13 @@ sequenceDiagram
     MQ->>C: deliver report.received
     alt payload does not parse
         C->>MQ: basic.reject(requeue=false) → gridlock.dlq
+        Note over C: stop
     end
     C->>DB: SELECT triage_results WHERE report_id = :id
     alt already triaged (redelivery)
         C->>OUT: re-publish stored outcome
         C->>MQ: basic.ack
+        Note over C: stop
     end
 
     alt reported_coords present
@@ -133,19 +135,19 @@ sequenceDiagram
     C->>CH: atriage(TriageChainInput) (timeout 2.4s)
     alt valid output
         CH-->>C: TriageChainOutput(tier, reason)
-        C->>DB: BEGIN; INSERT triage_results (success shape); guarded UPDATE state → TRIAGED; COMMIT
+        C->>DB: one transaction: INSERT triage_results (success shape) + guarded UPDATE → TRIAGED
         C->>OUT: publish report.triaged (confirm)
     else timeout or provider error
-        C->>DB: BEGIN; INSERT triage_results (failure shape, "model timeout/error: …"); guarded UPDATE → NEEDS_REVIEW; COMMIT
+        C->>DB: one transaction: INSERT triage_results (failure shape, "model timeout or error") + guarded UPDATE → NEEDS_REVIEW
         C->>OUT: publish report.needs_review (confirm)
     else output fails validation
-        C->>DB: BEGIN; INSERT triage_results (failure shape, "invalid model output: <raw>"); guarded UPDATE → NEEDS_REVIEW; COMMIT
+        C->>DB: one transaction: INSERT triage_results (failure shape, raw output kept) + guarded UPDATE → NEEDS_REVIEW
         C->>OUT: publish report.needs_review (confirm)
     end
-    alt DB or publish error
-        C->>MQ: basic.nack(requeue=true) — x-delivery-limit dead-letters after 3 attempts
-    else
+    alt committed and published
         C->>MQ: basic.ack
+    else DB or publish error
+        C->>MQ: basic.nack(requeue=true) — dead-lettered after 3 attempts
     end
 ```
 

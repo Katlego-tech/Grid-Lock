@@ -96,16 +96,18 @@ sequenceDiagram
     MQ->>V: deliver report.triaged {report_id, tier, grid_cell, …}
     alt grid_cell is null
         V->>MQ: basic.ack (never linked)
+        Note over V: stop
     end
     V->>DB: BEGIN
     V->>DB: SELECT incident_id, received_at FROM reports WHERE id = :id FOR UPDATE
     alt incident_id already set (redelivery)
         V->>DB: ROLLBACK
         V->>MQ: basic.ack
+        Note over V: stop
     end
     V->>V: cells = sorted(grid_disk(grid_cell, 1))  — the cell + its neighbours
     V->>DB: pg_advisory_xact_lock(hashtext(c)) for each c in cells, in order
-    V->>DB: SELECT … FROM incidents WHERE state='OPEN' AND grid_cell = ANY(:cells) AND last_report_at >= :received_at - interval '15 minutes' AND opened_at <= :received_at + interval '15 minutes'
+    V->>DB: OPEN incidents in cells whose window covers received_at (±15 min)
 
     alt an incident in the report's own cell
         V->>DB: link to it
@@ -116,13 +118,24 @@ sequenceDiagram
     else none at all
         V->>DB: INSERT incident in the report's cell, link to it
     end
-    Note over V,DB: "link" = UPDATE reports SET incident_id; UPDATE incidents SET report_count = COUNT(*), peak_tier = max, last_report_at = GREATEST(…)
+    Note over V,DB: link = set reports.incident_id, then report_count = COUNT(*), peak_tier = max, last_report_at = GREATEST(…)
     V->>DB: COMMIT
     V->>OUT: publish incident.updated (confirm)
-    V->>MQ: basic.ack
-    alt DB or publish error
+    alt committed and published
+        V->>MQ: basic.ack
+    else DB or publish error
         V->>MQ: basic.nack(requeue=true) — dead-lettered after 3 attempts
     end
+```
+
+The candidate query (step 9):
+
+```sql
+SELECT id, grid_cell FROM incidents
+ WHERE state = 'OPEN'
+   AND grid_cell = ANY(:cells)
+   AND last_report_at >= :received_at - interval '15 minutes'
+   AND opened_at      <= :received_at + interval '15 minutes';
 ```
 
 With the locks held, at most one open in-window incident can exist per cell, because any second

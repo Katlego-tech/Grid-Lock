@@ -117,6 +117,7 @@ sequenceDiagram
     Note over API: Step 1 — validate (≤ 2ms)
     alt description blank/whitespace or > 2000 chars, or bad coords
         API-->>C: 422 (nothing persisted, nothing published)
+        Note over API: stop
     end
 
     Note over API,DB: Step 2 — one transaction (≤ 35ms p95, 100ms statement timeout)
@@ -139,7 +140,7 @@ sequenceDiagram
 
     Note over SW,MQ: Step 4 — sweep, every 1s
     loop while the service runs
-        SW->>DB: SELECT … FROM outbox WHERE status='PENDING' AND created_at < now() - interval '2 seconds' ORDER BY created_at LIMIT 100 FOR UPDATE SKIP LOCKED
+        SW->>DB: claim ≤ 100 PENDING rows older than 2s (FOR UPDATE SKIP LOCKED)
         alt rows found and channel open
             SW->>MQ: publish each (publisher confirm)
             MQ-->>SW: basic.ack
