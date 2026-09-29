@@ -77,11 +77,12 @@ step() { printf '\n-> %s\n' "$*"; }
 bad()  { printf '!! %s\n' "$*"; }
 
 # Directories that can hold a project of their own. Root first, then this repo's
-# services/apps/packages layout, then the two flat layouts people actually use
-# before the microservices split happens.
+# services/apps/packages layout and infra/ (compose, broker topology and schema, whose
+# tests run against real Postgres and RabbitMQ), then the flat layouts people actually
+# use before the microservices split happens.
 project_dirs() {
   printf '%s\n' "$root"
-  for d in "$root"/services/* "$root"/apps/* "$root"/packages/* \
+  for d in "$root"/services/* "$root"/apps/* "$root"/packages/* "$root/infra" \
            "$root/backend" "$root/frontend" "$root/web" "$root/api"; do
     [ -d "$d" ] && printf '%s\n' "$d"
   done

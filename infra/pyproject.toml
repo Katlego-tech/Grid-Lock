@@ -1,0 +1,39 @@
+[project]
+name = "gridlock-infra"
+version = "0.1.0"
+description = "GridLock's database schema and broker topology, and the tests that hold them to the domain model."
+requires-python = ">=3.13"
+dependencies = []
+
+[dependency-groups]
+dev = [
+    "pika>=1.3",
+    "psycopg[binary]>=3.2",
+    "pyright>=1.1.400",
+    "pytest>=8.3",
+    "ruff>=0.12",
+    "testcontainers>=4.10",
+]
+
+[tool.uv]
+package = false
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra --strict-markers"
+
+[tool.ruff]
+line-length = 100
+target-version = "py313"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "SIM", "RUF"]
+
+[tool.ruff.lint.isort]
+# The test helpers are imported by module name from tests/ (pytest's rootdir import mode).
+known-first-party = ["conftest", "domain_model", "factories"]
+
+[tool.pyright]
+pythonVersion = "3.13"
+include = ["tests"]
+typeCheckingMode = "standard"
