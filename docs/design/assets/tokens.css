@@ -1,0 +1,57 @@
+/*
+ * GridLock design tokens: the one set both surfaces read from.
+ * apps/web (responder console) and apps/mobile (reporter app) derive their theme from these values.
+ * Where the file finally lives, and how React Native consumes it, is decided in
+ * responder-console.md (T006). Until then this file is the reference.
+ *
+ * The colour language comes from South African road signage: red for danger, amber for
+ * warning, blue for information, green for guidance. Tier colours mark rails, dots and chips.
+ * Text always stays ink-on-light, so a tier is never readable by colour alone.
+ */
+:root {
+  /* Ground and ink */
+  --gl-concrete: #dde2e4;      /* page ground */
+  --gl-surface: #fbfcfc;       /* cards, panels */
+  --gl-surface-sunk: #eef1f2;  /* expanded detail, inset areas */
+  --gl-ink: #0f1720;           /* primary text, header bar */
+  --gl-ink-muted: #56616c;     /* secondary text, meta */
+  --gl-rule: #c5ccd1;          /* hairlines, card borders */
+
+  /* Tiers: signage colours */
+  --gl-tier-critical: #d7261e; /* CRITICAL_DISPATCH: danger red */
+  --gl-tier-urgent: #e08600;   /* URGENT: warning amber */
+  --gl-tier-advisory: #1f5aa6; /* ADVISORY: information blue */
+  --gl-tier-monitor: #4f7a5e;  /* MONITOR: guidance green, muted */
+
+  /* Needs review: unranked, so it gets a pattern instead of a tier colour */
+  --gl-unranked-a: #0f1720;
+  --gl-unranked-b: #f2c230;    /* barrier yellow, used only inside the hatch */
+
+  /* Focus */
+  --gl-focus: #1f5aa6;
+
+  /* Type */
+  --gl-font-display: "Barlow Condensed", "Arial Narrow", sans-serif; /* tier names, counts: signage */
+  --gl-font-body: "Atkinson Hyperlegible", system-ui, sans-serif;    /* everything read under stress */
+  --gl-font-mono: "IBM Plex Mono", ui-monospace, monospace;          /* cell ids, clock times */
+
+  --gl-text-xs: 12px;
+  --gl-text-sm: 14px;
+  --gl-text-md: 16px;
+  --gl-text-lg: 18px;
+  --gl-text-xl: 24px;
+  --gl-text-2xl: 34px;
+
+  /* Shape and space */
+  --gl-radius: 6px;
+  --gl-rail: 44px;             /* width of the tier spine */
+  --gl-space-1: 4px;
+  --gl-space-2: 8px;
+  --gl-space-3: 12px;
+  --gl-space-4: 16px;
+  --gl-space-5: 24px;
+  --gl-space-6: 32px;
+
+  /* Touch */
+  --gl-hit: 44px;              /* minimum touch target, both surfaces */
+}

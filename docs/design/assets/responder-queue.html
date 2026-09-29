@@ -1,0 +1,349 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Responder queue — visual reference</title>
+<!-- Source for responder-queue.png (T007). Render: see docs/design/assets/README.md. -->
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Atkinson+Hyperlegible:wght@400;700&family=Barlow+Condensed:wght@500;600;700&family=IBM+Plex+Mono:wght@400;500&display=block" rel="stylesheet">
+<link rel="stylesheet" href="tokens.css">
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { background: #9aa4aa; font-family: var(--gl-font-body); color: var(--gl-ink); width: 1936px; padding: 40px 40px 48px; }
+  button { font: inherit; color: inherit; background: none; border: 0; cursor: pointer; }
+
+  /* ---- board ---- */
+  .row { display: flex; gap: 40px; align-items: flex-start; }
+  .row + .row { margin-top: 44px; }
+  .frame-label { font-family: var(--gl-font-mono); font-size: 13px; color: #1d262e; margin-bottom: 10px; letter-spacing: .02em; }
+  .frame-label b { font-weight: 500; background: var(--gl-ink); color: #fff; padding: 2px 7px; border-radius: 3px; margin-right: 8px; }
+  .frame { background: var(--gl-concrete); border-radius: 10px; overflow: hidden; box-shadow: 0 1px 0 rgba(0,0,0,.08), 0 18px 40px -18px rgba(15,23,32,.45); }
+  .desk { width: 1440px; }
+  .phone { width: 375px; height: 812px; border-radius: 28px; border: 8px solid var(--gl-ink); }
+
+  /* ---- top bar ---- */
+  .bar { background: var(--gl-ink); color: #fff; display: flex; align-items: center; gap: 28px; padding: 0 28px; height: 60px; }
+  .mark { display: flex; align-items: center; gap: 10px; font-family: var(--gl-font-display); font-weight: 700; font-size: 26px; letter-spacing: .01em; }
+  .mark svg { width: 22px; height: 24px; }
+  .bar h1 { font-size: 16px; font-weight: 400; color: #b8c2ca; }
+  .tally { display: flex; gap: 6px; margin-left: 8px; }
+  .tally span { font-family: var(--gl-font-display); font-weight: 600; font-size: 17px; letter-spacing: .04em; padding: 2px 10px 2px 8px; border-radius: 4px; background: #1d2833; display: flex; gap: 7px; align-items: center; }
+  .tally i { width: 9px; height: 9px; border-radius: 2px; display: inline-block; }
+  .tally em { font-style: normal; color: #b8c2ca; font-weight: 500; }
+  .live { margin-left: auto; display: flex; align-items: center; gap: 10px; font-size: 14px; color: #b8c2ca; }
+  .live .dot { width: 9px; height: 9px; border-radius: 50%; background: #4cc38a; box-shadow: 0 0 0 4px rgba(76,195,138,.18); }
+  .live time { font-family: var(--gl-font-mono); color: #fff; font-size: 15px; }
+
+  /* ---- layout ---- */
+  .desk-body { display: grid; grid-template-columns: 1fr 420px; gap: 24px; padding: 24px 28px 28px; align-items: start; }
+
+  /* ---- ranked bands: the tier spine ---- */
+  .band { display: grid; grid-template-columns: var(--gl-rail) 1fr; }
+  .band + .band { margin-top: 14px; }
+  .spine { background: var(--tier); color: var(--spine-ink, #fff); border-radius: var(--gl-radius) 0 0 var(--gl-radius); display: flex; flex-direction: column; align-items: center; justify-content: space-between; padding: 12px 0 10px; }
+  .spine span { writing-mode: vertical-rl; transform: rotate(180deg); font-family: var(--gl-font-display); font-weight: 700; font-size: 19px; letter-spacing: .09em; text-transform: uppercase; white-space: nowrap; }
+  .spine b { font-family: var(--gl-font-display); font-weight: 700; font-size: 20px; }
+  .cards { display: flex; flex-direction: column; gap: 2px; background: var(--gl-rule); border: 1px solid var(--gl-rule); border-left: 0; border-radius: 0 var(--gl-radius) var(--gl-radius) 0; overflow: hidden; }
+  .t-critical { --tier: var(--gl-tier-critical); }
+  .t-urgent { --tier: var(--gl-tier-urgent); --spine-ink: var(--gl-ink); }
+  .t-advisory { --tier: var(--gl-tier-advisory); }
+  .t-monitor { --tier: var(--gl-tier-monitor); }
+
+  /* ---- card ---- */
+  .card { flex: 1; background: var(--gl-surface); display: grid; grid-template-columns: 1fr auto; gap: 8px 24px; padding: 16px 18px 15px 20px; align-items: start; }
+  .reason { font-size: 18px; line-height: 1.4; font-weight: 700; max-width: 62ch; }
+  .meta { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 22px; margin-top: 8px; font-size: 14px; color: var(--gl-ink-muted); }
+  .count { display: inline-flex; align-items: center; gap: 8px; color: var(--gl-ink); font-weight: 700; }
+  .dots { display: inline-flex; gap: 3px; }
+  .dots i { width: 8px; height: 8px; border-radius: 50%; background: var(--tier); }
+  .t-urgent .dots i { box-shadow: inset 0 0 0 1px rgba(15,23,32,.25); }
+  .age { color: var(--gl-ink); }
+  .age time, .when { font-family: var(--gl-font-mono); font-size: 13px; color: var(--gl-ink-muted); margin-left: 6px; }
+  .loc code { font-family: var(--gl-font-mono); font-size: 13px; }
+  .loc.none { font-style: italic; }
+  .ack { align-self: center; min-height: var(--gl-hit); padding: 0 18px; border-radius: var(--gl-radius); border: 1.5px solid var(--gl-ink); font-weight: 700; font-size: 15px; background: var(--gl-surface); white-space: nowrap; }
+  .ack.primary { background: var(--gl-ink); color: #fff; }
+  .ack.focus { outline: 3px solid var(--gl-focus); outline-offset: 2px; }
+  .more { grid-column: 1 / -1; display: inline-flex; align-items: center; gap: 6px; font-size: 14px; font-weight: 700; color: var(--gl-ink); text-decoration: underline; text-underline-offset: 3px; justify-self: start; min-height: 28px; }
+  .expanded { grid-column: 1 / -1; background: var(--gl-surface-sunk); border-radius: 4px; padding: 12px 14px 12px; margin-top: 2px; }
+  .expanded ol { list-style: none; display: grid; gap: 8px; }
+  .expanded li { display: grid; grid-template-columns: 58px 1fr; font-size: 15px; line-height: 1.4; }
+  .expanded li .when { margin: 1px 0 0; }
+  .expanded p.rule { margin-top: 10px; font-size: 13px; color: var(--gl-ink-muted); }
+  q { quotes: "\201C" "\201D"; }
+
+  /* ---- needs review ---- */
+  .review { background: var(--gl-surface); border-radius: var(--gl-radius); border: 1px solid var(--gl-rule); overflow: hidden; }
+  .hatch { height: 10px; background: repeating-linear-gradient(-45deg, var(--gl-unranked-a) 0 10px, var(--gl-unranked-b) 10px 20px); }
+  .review header { padding: 14px 18px 12px; border-bottom: 1px solid var(--gl-rule); }
+  .review h2 { font-family: var(--gl-font-display); font-weight: 700; font-size: 24px; letter-spacing: .04em; text-transform: uppercase; display: flex; align-items: baseline; gap: 10px; }
+  .review h2 b { font-size: 24px; }
+  .review header p { font-size: 14px; color: var(--gl-ink-muted); margin-top: 2px; }
+  .ritem { padding: 14px 18px 16px; display: grid; gap: 8px; }
+  .ritem + .ritem { border-top: 1px solid var(--gl-rule); }
+  .why { font-size: 14px; font-weight: 700; display: flex; justify-content: space-between; gap: 12px; }
+  .why span:last-child { font-weight: 400; color: var(--gl-ink); white-space: nowrap; }
+  .ritem blockquote { font-size: 16px; line-height: 1.45; }
+  .ritem .foot { display: flex; align-items: center; justify-content: space-between; font-size: 14px; color: var(--gl-ink-muted); }
+
+  /* ---- phone ---- */
+  .phone .bar { height: 52px; padding: 0 16px; gap: 12px; }
+  .phone .mark { font-size: 22px; }
+  .phone .live { font-size: 13px; gap: 8px; }
+  .strip { display: flex; align-items: stretch; background: var(--gl-surface); border-bottom: 1px solid var(--gl-rule); }
+  .strip .hatch { width: 10px; height: auto; }
+  .strip > div:not(.hatch) { flex: 1; padding: 11px 14px; }
+  .strip strong { font-family: var(--gl-font-display); font-size: 20px; letter-spacing: .04em; text-transform: uppercase; }
+  .strip p { font-size: 13px; color: var(--gl-ink-muted); }
+  .strip button { font-weight: 700; font-size: 15px; padding: 0 14px; min-width: var(--gl-hit); text-decoration: underline; text-underline-offset: 3px; }
+  .phone-body { padding: 12px 12px 0; }
+  .hband + .hband { margin-top: 12px; }
+  .hband h2 { background: var(--tier); color: var(--spine-ink, #fff); font-family: var(--gl-font-display); font-weight: 700; font-size: 17px; letter-spacing: .09em; text-transform: uppercase; padding: 5px 12px; border-radius: var(--gl-radius) var(--gl-radius) 0 0; display: flex; justify-content: space-between; }
+  .hband .cards { border-left: 1px solid var(--gl-rule); border-radius: 0 0 var(--gl-radius) var(--gl-radius); }
+  .phone .card { grid-template-columns: 1fr; padding: 14px 14px 14px; gap: 10px; }
+  .phone .reason { font-size: 17px; }
+  .phone .meta { gap: 4px 16px; font-size: 13.5px; }
+  .phone .ack { width: 100%; }
+  .phone .more { min-height: var(--gl-hit); margin-top: -6px; }
+
+  /* ---- empty ---- */
+  .empty-body { display: grid; grid-template-columns: 1fr 420px; gap: 24px; padding: 24px 28px 28px; }
+  .empty-main { border: 2px dashed var(--gl-rule); border-radius: var(--gl-radius); padding: 44px 48px; background: rgba(251,252,252,.55); }
+  .empty-main h2 { font-family: var(--gl-font-display); font-weight: 700; font-size: var(--gl-text-2xl); letter-spacing: .02em; }
+  .empty-main p { font-size: 17px; margin-top: 8px; max-width: 56ch; line-height: 1.45; }
+  .empty-main p.checked { font-size: 14px; color: var(--gl-ink-muted); margin-top: 18px; }
+  .empty-main p.checked time { font-family: var(--gl-font-mono); }
+  .review .none { padding: 18px; font-size: 16px; }
+</style>
+</head>
+<body>
+
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+  <symbol id="hex" viewBox="0 0 22 24"><path d="M11 1.5 20.5 7v10L11 22.5 1.5 17V7z" fill="none" stroke="currentColor" stroke-width="2.4"/><path d="M11 8.2 15.2 10.6v4.8L11 17.8l-4.2-2.4v-4.8z" fill="currentColor"/></symbol>
+</svg>
+
+<div class="row">
+  <!-- ============ A: desk, populated ============ -->
+  <div>
+    <p class="frame-label"><b>A</b>Queue, populated — desk, 1440 px wide</p>
+    <div class="frame desk">
+      <div class="bar">
+        <div class="mark"><svg><use href="#hex"/></svg>GridLock</div>
+        <h1>Responder queue</h1>
+        <div class="tally" aria-label="Open reports by tier">
+          <span><i style="background:var(--gl-tier-critical)"></i><em>CRIT</em>2</span>
+          <span><i style="background:var(--gl-tier-urgent)"></i><em>URG</em>2</span>
+          <span><i style="background:var(--gl-tier-advisory)"></i><em>ADV</em>1</span>
+          <span><i style="background:var(--gl-tier-monitor)"></i><em>MON</em>1</span>
+        </div>
+        <div class="live"><span class="dot"></span>Live · updated 3 s ago <time>21:48</time></div>
+      </div>
+
+      <div class="desk-body">
+        <main>
+          <section class="band t-critical">
+            <h2 class="spine"><span>Critical dispatch</span><b>2</b></h2>
+            <div class="cards">
+              <article class="card">
+                <div>
+                  <p class="reason">Reporter says men are breaking through their back gate at 14 Sisulu Street while the family is inside.</p>
+                  <div class="meta">
+                    <span class="count"><span class="dots"><i></i><i></i><i></i></span>3 reports</span>
+                    <span class="age">6 min<time>21:42</time></span>
+                    <span class="loc">Phone GPS · <code>89bcc3cc96bffff</code></span>
+                  </div>
+                </div>
+                <button class="ack primary">Acknowledge all 3</button>
+                <button class="more">▾ Hide the 3 reports</button>
+                <div class="expanded">
+                  <ol>
+                    <li><time class="when">21:42</time><q>men breaking through my back gate, 14 Sisulu Street, we are inside</q></li>
+                    <li><time class="when">21:43</time><q>hearing banging and shouting at number 14 Sisulu, sounds like they are forcing the gate</q></li>
+                    <li><time class="when">21:45</time><q>3 guys at the gate of the house on the corner of Sisulu, one has a crowbar</q></li>
+                  </ol>
+                  <p class="rule">Grouped because they were sent from the same or a neighbouring cell (about 350 m), each within 15 minutes of the last.</p>
+                </div>
+              </article>
+              <article class="card">
+                <div>
+                  <p class="reason">Reporter says armed men are forcing the back door while they and their children are inside.</p>
+                  <div class="meta">
+                    <span class="count"><span class="dots"><i></i></span>1 report</span>
+                    <span class="age">18 min<time>21:30</time></span>
+                    <span class="loc none">Location unknown</span>
+                  </div>
+                </div>
+                <button class="ack primary">Acknowledge</button>
+              </article>
+            </div>
+          </section>
+
+          <section class="band t-urgent">
+            <h2 class="spine"><span>Urgent</span><b>2</b></h2>
+            <div class="cards">
+              <article class="card">
+                <div>
+                  <p class="reason">Two people are climbing onto the roof of a spaza shop to get inside, right now.</p>
+                  <div class="meta">
+                    <span class="count"><span class="dots"><i></i><i></i></span>2 reports</span>
+                    <span class="age">9 min<time>21:39</time></span>
+                    <span class="loc">Matched a landmark · <code>89bcc3cc963ffff</code></span>
+                  </div>
+                </div>
+                <button class="ack">Acknowledge both</button>
+                <button class="more">▸ Show the 2 reports</button>
+              </article>
+              <article class="card">
+                <div>
+                  <p class="reason">A break-in is in progress at a house the reporter says is empty; the owners are overseas.</p>
+                  <div class="meta">
+                    <span class="count"><span class="dots"><i></i></span>1 report</span>
+                    <span class="age">2 min<time>21:46</time></span>
+                    <span class="loc none">Location unknown</span>
+                  </div>
+                </div>
+                <button class="ack">Acknowledge</button>
+              </article>
+            </div>
+          </section>
+
+          <section class="band t-advisory">
+            <h2 class="spine"><span>Advisory</span><b>1</b></h2>
+            <div class="cards">
+              <article class="card">
+                <div>
+                  <p class="reason">Reporter found their car window smashed overnight and the radio gone.</p>
+                  <div class="meta">
+                    <span class="count"><span class="dots"><i></i></span>1 report</span>
+                    <span class="age">34 min<time>21:14</time></span>
+                    <span class="loc">Ambiguous: matched 2 places</span>
+                  </div>
+                </div>
+                <button class="ack">Acknowledge</button>
+              </article>
+            </div>
+          </section>
+
+          <section class="band t-monitor">
+            <h2 class="spine"><span>Monitor</span><b>1</b></h2>
+            <div class="cards">
+              <article class="card">
+                <div>
+                  <p class="reason">Reporter says the corner streetlight has been out since Tuesday.</p>
+                  <div class="meta">
+                    <span class="count"><span class="dots"><i></i></span>1 report</span>
+                    <span class="age">1 h 12 min<time>20:36</time></span>
+                    <span class="loc none">Location unknown</span>
+                  </div>
+                </div>
+                <button class="ack">Acknowledge</button>
+              </article>
+            </div>
+          </section>
+        </main>
+
+        <aside class="review">
+          <div class="hatch"></div>
+          <header>
+            <h2>Needs review <b>2</b></h2>
+            <p>Not ranked. GridLock couldn't assign a tier, so read these yourself.</p>
+          </header>
+          <div class="ritem">
+            <p class="why"><span>Couldn't rank: the triage model timed out</span><span>7 min</span></p>
+            <blockquote><q>please send someone the old man at no 9 is shouting for help</q></blockquote>
+            <div class="foot"><span class="loc none">Location unknown</span><button class="ack">Acknowledge</button></div>
+          </div>
+          <div class="ritem">
+            <p class="why"><span>Waiting for triage</span><span>20 s</span></p>
+            <blockquote><q>there's smoke coming from the house behind the tavern, I can't see anyone</q></blockquote>
+            <div class="foot"><span class="loc none">Location not checked yet</span><button class="ack">Acknowledge</button></div>
+          </div>
+        </aside>
+      </div>
+    </div>
+  </div>
+
+  <!-- ============ B: phone, populated ============ -->
+  <div>
+    <p class="frame-label"><b>B</b>Same queue — 375 px, one hand</p>
+    <div class="frame phone">
+      <div class="bar">
+        <div class="mark"><svg><use href="#hex"/></svg>GridLock</div>
+        <div class="live"><span class="dot"></span>Live <time>21:48</time></div>
+      </div>
+      <div class="strip">
+        <div class="hatch"></div>
+        <div><strong>2 need review</strong><p>Not ranked · oldest 7 min</p></div>
+        <button>Show</button>
+      </div>
+      <div class="phone-body">
+        <section class="hband t-critical">
+          <h2><span>Critical dispatch</span><span>2</span></h2>
+          <div class="cards">
+            <article class="card">
+              <p class="reason">Reporter says men are breaking through their back gate at 14 Sisulu Street while the family is inside.</p>
+              <div class="meta">
+                <span class="count"><span class="dots"><i></i><i></i><i></i></span>3 reports</span>
+                <span class="age">6 min<time>21:42</time></span>
+                <span class="loc">Phone GPS</span>
+              </div>
+              <button class="more">▸ Show the 3 reports</button>
+              <button class="ack primary">Acknowledge all 3</button>
+            </article>
+            <article class="card">
+              <p class="reason">Reporter says armed men are forcing the back door while they and their children are inside.</p>
+              <div class="meta">
+                <span class="count"><span class="dots"><i></i></span>1 report</span>
+                <span class="age">18 min<time>21:30</time></span>
+                <span class="loc none">Location unknown</span>
+              </div>
+              <button class="ack primary">Acknowledge</button>
+            </article>
+          </div>
+        </section>
+        <section class="hband t-urgent">
+          <h2><span>Urgent</span><span>2</span></h2>
+          <div class="cards">
+            <article class="card">
+              <p class="reason">Two people are climbing onto the roof of a spaza shop to get inside, right now.</p>
+              <div class="meta">
+                <span class="count"><span class="dots"><i></i><i></i></span>2 reports</span>
+                <span class="age">9 min<time>21:39</time></span>
+              </div>
+            </article>
+          </div>
+        </section>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="row">
+  <!-- ============ C: desk, empty ============ -->
+  <div>
+    <p class="frame-label"><b>C</b>Queue, empty — desk, 1440 px wide</p>
+    <div class="frame desk">
+      <div class="bar">
+        <div class="mark"><svg><use href="#hex"/></svg>GridLock</div>
+        <h1>Responder queue</h1>
+        <div class="live"><span class="dot"></span>Live · updated 2 s ago <time>04:12</time></div>
+      </div>
+      <div class="empty-body">
+        <div class="empty-main">
+          <h2>No open reports</h2>
+          <p>New reports appear here, ranked by tier, within 5 seconds of being sent. Reports you acknowledge leave this list.</p>
+          <p class="checked">Last checked <time>04:12:31</time></p>
+        </div>
+        <aside class="review">
+          <div class="hatch"></div>
+          <header><h2>Needs review <b>0</b></h2></header>
+          <p class="none">Nothing is waiting for review.</p>
+        </aside>
+      </div>
+    </div>
+  </div>
+</div>
+
+</body>
+</html>
