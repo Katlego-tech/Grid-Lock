@@ -96,6 +96,7 @@ project_dirs() {
 py_runner=""      # how to invoke a tool, e.g. "uv run --frozen" or "/path/.venv/bin/python -m"
 py_kind=""
 py_venv=""        # the virtualenv the runner belongs to, when it is one
+py_python=""      # that virtualenv's interpreter, when it is one
 
 # Run a Python tool in $1, with the environment the tool expects.
 #
@@ -108,7 +109,8 @@ py_venv=""        # the virtualenv the runner belongs to, when it is one
 pyrun() {
   local d="$1"; shift
   if [ -n "$py_venv" ]; then
-    ( cd "$d" && VIRTUAL_ENV="$py_venv" PATH="$py_venv/bin:$PATH" $py_runner "$@" )
+    ( cd "$d" && VIRTUAL_ENV="$py_venv" PATH="$(path_entry "$(venv_bin "$py_venv")"):$PATH" \
+        $py_runner "$@" )
   else
     ( cd "$d" && $py_runner "$@" )
   fi
@@ -118,17 +120,52 @@ is_python_project() {
   [ -f "$1/pyproject.toml" ] || [ -f "$1/requirements.txt" ] || [ -f "$1/setup.py" ]
 }
 
+# A uv workspace root with no [project] of its own ties its members together (one
+# uv.lock, one .venv) but has no code: its members are checked one by one instead.
+is_workspace_root() {
+  [ -f "$1/pyproject.toml" ] \
+    && grep -q '^\[tool\.uv\.workspace\]' "$1/pyproject.toml" \
+    && ! grep -q '^\[project\]' "$1/pyproject.toml"
+}
+
+# The directory a virtualenv keeps its executables in: bin/ everywhere except Windows,
+# where it is Scripts/. Checking only bin/ is how a Windows clone skipped its venv.
+venv_bin() {
+  if [ -d "$1/Scripts" ] && [ ! -d "$1/bin" ]; then printf '%s\n' "$1/Scripts"
+  else printf '%s\n' "$1/bin"
+  fi
+}
+
+# A directory as it must appear in $PATH. On Windows, git reports the repo as C:/Users/...,
+# and Git Bash splits PATH on ':' -- so "C:/..." becomes "C" and "/...", the venv drops
+# off PATH, and tools that look up `python` find the Microsoft Store stub instead.
+path_entry() {
+  if command -v cygpath >/dev/null 2>&1; then cygpath -u "$1"; else printf '%s\n' "$1"; fi
+}
+
+venv_python() {
+  local bin; bin="$(venv_bin "$1")"
+  if   [ -x "$bin/python" ];     then printf '%s\n' "$bin/python"
+  elif [ -x "$bin/python.exe" ]; then printf '%s\n' "$bin/python.exe"
+  else return 1
+  fi
+}
+
 resolve_python() {
   local dir="$1"
-  py_runner=""; py_kind=""; py_venv=""
+  py_runner=""; py_kind=""; py_venv=""; py_python=""
 
-  if [ -x "$dir/.venv/bin/python" ]; then
-    py_runner="$dir/.venv/bin/python -m"; py_kind="venv ($dir/.venv)"; py_venv="$dir/.venv"; return 0
+  local py
+  if py="$(venv_python "$dir/.venv")"; then
+    py_runner="$py -m"; py_kind="venv ($dir/.venv)"; py_venv="$dir/.venv"; py_python="$py"
+    return 0
   fi
-  if [ -x "$root/.venv/bin/python" ]; then
-    py_runner="$root/.venv/bin/python -m"; py_kind="venv ($root/.venv)"; py_venv="$root/.venv"; return 0
+  if py="$(venv_python "$root/.venv")"; then
+    py_runner="$py -m"; py_kind="venv ($root/.venv)"; py_venv="$root/.venv"; py_python="$py"
+    return 0
   fi
-  if [ -f "$dir/uv.lock" ] && command -v uv >/dev/null 2>&1; then
+  # A workspace member is locked by the root's uv.lock, not one of its own.
+  if { [ -f "$dir/uv.lock" ] || [ -f "$root/uv.lock" ]; } && command -v uv >/dev/null 2>&1; then
     py_runner="uv run --frozen"; py_kind="uv (uv.lock)"; return 0
   fi
   if command -v uv >/dev/null 2>&1 && [ -f "$dir/pyproject.toml" ]; then
@@ -145,6 +182,10 @@ resolve_python() {
 check_python() {
   local dir="$1" rel="$2" rc
   is_python_project "$dir" || return 0
+  if is_workspace_root "$dir"; then
+    say "   $rel: uv workspace root -- its members are checked one by one below"
+    return 0
+  fi
   manifests=$((manifests + 1))
 
   if ! resolve_python "$dir"; then
@@ -180,7 +221,12 @@ check_python() {
   # sees if someone thought to write that test.
   if pyrun "$dir" pyright --version >/dev/null 2>&1; then
     step "pyright ($rel)"
-    pyrun "$dir" pyright || fail=1
+    # Name the interpreter outright rather than trusting pyright to find `python` on PATH.
+    if [ -n "$py_python" ]; then
+      pyrun "$dir" pyright --pythonpath "$py_python" || fail=1
+    else
+      pyrun "$dir" pyright || fail=1
+    fi
     ran=$((ran + 1))
   else
     bad "$rel has no pyright in its environment, so its type check cannot run."
@@ -457,6 +503,7 @@ committed_lockfile() {
 # missing lockfile fails here rather than letting the scan quietly cover less.
 collect_lockfiles() {
   local dir="$1" rel="$2" kind lock
+  is_workspace_root "$dir" && return 0   # its uv.lock is collected through its members
   for kind in py node; do
     if [ "$kind" = py ]; then is_python_project "$dir" || continue
     else [ -f "$dir/package.json" ] || continue
@@ -600,7 +647,20 @@ duplication_check() {
 install_deps() {
   local dir="$1" rel="$2" pm
 
-  if is_python_project "$dir"; then
+  if is_workspace_root "$dir"; then
+    # One sync installs every member, with each member's dev tools, into the root .venv.
+    step "install Python workspace ($rel: every member, all dependency groups)"
+    if ! command -v uv >/dev/null 2>&1; then
+      bad "   uv is not on PATH -- cannot install the Python workspace."
+      fail=1
+    else
+      ( cd "$dir" && uv sync --frozen --all-packages --all-groups ) || fail=1
+    fi
+  elif is_python_project "$dir" && [ "$dir" != "$root" ] && is_workspace_root "$root" \
+       && [ ! -f "$dir/uv.lock" ]; then
+    manifests=$((manifests + 1))
+    say "   $rel: workspace member -- installed by the root sync"
+  elif is_python_project "$dir"; then
     manifests=$((manifests + 1))
     step "install Python dependencies ($rel)"
     if ! command -v uv >/dev/null 2>&1; then
