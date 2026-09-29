@@ -96,6 +96,7 @@ project_dirs() {
 py_runner=""      # how to invoke a tool, e.g. "uv run --frozen" or "/path/.venv/bin/python -m"
 py_kind=""
 py_venv=""        # the virtualenv the runner belongs to, when it is one
+py_python=""      # that virtualenv's interpreter, when it is one
 
 # Run a Python tool in $1, with the environment the tool expects.
 #
@@ -108,7 +109,8 @@ py_venv=""        # the virtualenv the runner belongs to, when it is one
 pyrun() {
   local d="$1"; shift
   if [ -n "$py_venv" ]; then
-    ( cd "$d" && VIRTUAL_ENV="$py_venv" PATH="$(venv_bin "$py_venv"):$PATH" $py_runner "$@" )
+    ( cd "$d" && VIRTUAL_ENV="$py_venv" PATH="$(path_entry "$(venv_bin "$py_venv")"):$PATH" \
+        $py_runner "$@" )
   else
     ( cd "$d" && $py_runner "$@" )
   fi
@@ -134,6 +136,13 @@ venv_bin() {
   fi
 }
 
+# A directory as it must appear in $PATH. On Windows, git reports the repo as C:/Users/...,
+# and Git Bash splits PATH on ':' -- so "C:/..." becomes "C" and "/...", the venv drops
+# off PATH, and tools that look up `python` find the Microsoft Store stub instead.
+path_entry() {
+  if command -v cygpath >/dev/null 2>&1; then cygpath -u "$1"; else printf '%s\n' "$1"; fi
+}
+
 venv_python() {
   local bin; bin="$(venv_bin "$1")"
   if   [ -x "$bin/python" ];     then printf '%s\n' "$bin/python"
@@ -144,14 +153,16 @@ venv_python() {
 
 resolve_python() {
   local dir="$1"
-  py_runner=""; py_kind=""; py_venv=""
+  py_runner=""; py_kind=""; py_venv=""; py_python=""
 
   local py
   if py="$(venv_python "$dir/.venv")"; then
-    py_runner="$py -m"; py_kind="venv ($dir/.venv)"; py_venv="$dir/.venv"; return 0
+    py_runner="$py -m"; py_kind="venv ($dir/.venv)"; py_venv="$dir/.venv"; py_python="$py"
+    return 0
   fi
   if py="$(venv_python "$root/.venv")"; then
-    py_runner="$py -m"; py_kind="venv ($root/.venv)"; py_venv="$root/.venv"; return 0
+    py_runner="$py -m"; py_kind="venv ($root/.venv)"; py_venv="$root/.venv"; py_python="$py"
+    return 0
   fi
   # A workspace member is locked by the root's uv.lock, not one of its own.
   if { [ -f "$dir/uv.lock" ] || [ -f "$root/uv.lock" ]; } && command -v uv >/dev/null 2>&1; then
@@ -210,7 +221,12 @@ check_python() {
   # sees if someone thought to write that test.
   if pyrun "$dir" pyright --version >/dev/null 2>&1; then
     step "pyright ($rel)"
-    pyrun "$dir" pyright || fail=1
+    # Name the interpreter outright rather than trusting pyright to find `python` on PATH.
+    if [ -n "$py_python" ]; then
+      pyrun "$dir" pyright --pythonpath "$py_python" || fail=1
+    else
+      pyrun "$dir" pyright || fail=1
+    fi
     ran=$((ran + 1))
   else
     bad "$rel has no pyright in its environment, so its type check cannot run."
