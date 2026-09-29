@@ -93,9 +93,17 @@ docker-compose.yml     the whole system, locally
 The backing services run now; the four services join `docker-compose.yml` as they are built.
 
 ```bash
-uv python install 3.13     # the project pins 3.13
+uv python install 3.13     # .python-version pins 3.13, whatever the system Python is
 cp .env.example .env       # set your own local passwords
-docker compose up -d       # PostgreSQL (PostGIS + pgvector), RabbitMQ, and the queue topology
+docker compose up -d       # PostgreSQL (PostGIS + pgvector), RabbitMQ, schema and queues
+```
+
+For development, install every project's dependencies from the committed lockfiles:
+
+```bash
+uv sync --all-packages --all-groups   # the Python workspace: one uv.lock, one .venv
+(cd apps/web && npm ci)               # the responder console (Node 24, per .nvmrc)
+bash scripts/gate.sh                  # everything CI runs, locally
 ```
 
 See [`infra/README.md`](infra/README.md) for ports, queues and dead-lettering.

@@ -1,0 +1,14 @@
+# The GridLock Python workspace: one lockfile (uv.lock, next to this file) for every Python
+# project in the repo, so the same dependency resolves to the same version everywhere.
+#
+# This root is not a project itself -- it has no code and no [project] table. Each member is
+# checked on its own by scripts/gate.sh; the root only ties them together.
+#
+#   uv python install 3.13           # the version .python-version pins
+#   uv sync --all-packages --all-groups   # every member, with its dev tools
+#
+# A new Python project (packages/contracts, services/<name>) joins by existing under one of
+# the paths below with its own pyproject.toml; run `uv lock` and commit uv.lock.
+
+[tool.uv.workspace]
+members = ["infra", "packages/*", "services/*"]
