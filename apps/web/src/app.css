@@ -1,0 +1,58 @@
+/* Values come from docs/design/assets/tokens.css; this file only arranges them. */
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  background: var(--gl-concrete);
+  color: var(--gl-ink);
+  font-family: var(--gl-font-body);
+  font-size: var(--gl-text-md);
+}
+
+.bar {
+  display: flex;
+  align-items: center;
+  gap: var(--gl-space-6);
+  min-height: 60px;
+  padding: 0 var(--gl-space-6);
+  background: var(--gl-ink);
+  color: #fff;
+}
+
+.mark {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-family: var(--gl-font-display);
+  font-weight: 700;
+  font-size: 26px;
+}
+
+.mark-icon {
+  width: 22px;
+  height: 24px;
+}
+
+.bar h1 {
+  margin: 0;
+  font-size: var(--gl-text-md);
+  font-weight: 400;
+  color: #b8c2ca;
+}
+
+.desk {
+  padding: var(--gl-space-5) var(--gl-space-6);
+}
+
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
