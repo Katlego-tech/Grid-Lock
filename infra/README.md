@@ -1,11 +1,13 @@
 # infra — the local stack
 
-PostgreSQL (with PostGIS and pgvector) and RabbitMQ, with the queue topology every GridLock
-service builds against, and the tests that check both against a real server.
+PostgreSQL (with PostGIS and pgvector) and RabbitMQ, the schema and queue topology every
+GridLock service builds against, and the tests that check them against a real server.
 
 ```
 postgres/Dockerfile          PostGIS 17 base image + pgvector
 postgres/init.sql            enables the postgis and vector extensions (runs once, on a new volume)
+postgres/migrations/         the schema, one numbered file per change (0001_init.sql, ...)
+postgres/migrate.sh          applies migrations not yet applied; the db-migrate job runs it
 rabbitmq/definitions.json    exchanges, queues, bindings, dead-lettering
 tests/                       run against real Postgres + RabbitMQ (no mocks)
 ```
@@ -17,7 +19,7 @@ From the repo root:
 ```bash
 cp .env.example .env        # set your own local passwords
 docker compose up -d
-docker compose ps           # postgres + rabbitmq "healthy"; rabbitmq-topology "exited (0)"
+docker compose ps -a        # postgres + rabbitmq "healthy"; db-migrate + rabbitmq-topology "exited (0)"
 ```
 
 - **Postgres** listens on `localhost:5432`, database `gridlock`, with `postgis` and `vector`
@@ -30,6 +32,60 @@ docker compose ps           # postgres + rabbitmq "healthy"; rabbitmq-topology "
   doesn't use `load_definitions`, because a broker that imports definitions at boot doesn't
   create `RABBITMQ_DEFAULT_USER`, and then nothing can log in. This was checked on RabbitMQ 3.12
   and 4.1.
+
+## Schema
+
+`postgres/migrations/0001_init.sql` implements domain-model §3: tables `reports`,
+`triage_results`, `incidents` and `landmarks`, field for field with the class diagram. The test
+suite reads the diagram out of `docs/design/domain-model.md` and fails if the two differ in
+either direction. `corroboration_count` is not a column; it is computed when the queue is read.
+
+The database enforces the rules itself, so no service (or hand-typed `psql`) can get round
+them:
+
+- **Grounding.** A result with `location_confidence` `AMBIGUOUS` or `UNKNOWN` can't have a
+  `grid_cell` or `resolved_coords`. That's four named constraints, e.g.
+  `triage_ambiguous_has_no_grid_cell`.
+- **Grid cells are H3 res-9 cells.** A `h3_cell` domain accepts 15 lower-case hex characters
+  starting `89`, so a suburb name can't end up where incidents are grouped. verification.md
+  §6.3 says `VARCHAR(15)`; this is the same length, with the format checked as well.
+- **One outcome per result.** A result has either `tier` + `reason` or a `failure_reason`, never
+  both and never neither.
+- **Report lifecycle.** `state` moves only along the §5 diagram. `TRIAGED` needs a result with a
+  tier, and `NEEDS_REVIEW` a result with a failure. Write the result first, then move the report.
+- **Evidence and audit trail.** What the reporter sent is never rewritten. Reports and results
+  are never deleted or truncated. A resolved report's `incident_id` is final, and a report can
+  only join an `OPEN` incident.
+- **Incidents stay `OPEN`.** `MERGED` and `CLOSED` are reserved until closing and merging are
+  designed (domain-model §10). `opened_at` and `last_report_at` are report times with no
+  `now()` default: the verifier passes `received_at` (verification.md invariant 4).
+- **Evidence** is stored in the result as JSON `[{landmark_id, text, similarity}, …]` with exactly
+  those keys. That way a rebuilt landmark index can never change the evidence behind a past
+  decision.
+
+What the database can't do yet: **stop a superuser.** Compose's `POSTGRES_USER` is a superuser
+and can disable triggers (`SET session_replication_role = replica`) or drop constraints. Each
+service should connect as its own non-superuser role, created alongside the first service that
+uses the database. Until then, the guarantees above hold against application writes, not
+against a superuser who sets out to bypass them.
+
+It also can't **reject off-globe coordinates.** PostGIS silently moves latitude
+−95 to −85 while parsing the value, before any constraint sees it, and stores a real-looking
+point about 1,100 km away. Whatever accepts coordinates (the contracts model, ingest-api) must
+return 422 for lat outside [−90, 90] or lon outside [−180, 180]. A test pins this behaviour.
+
+### Changing the schema
+
+Add a new file, `postgres/migrations/0002_<what>.sql`. Never edit a merged one. `migrate.sh`
+runs each file once, in filename order, in one transaction with its record in
+`schema_migrations`, so a failing migration leaves no trace. It runs on every
+`docker compose up` and skips what's already applied. Every service that uses the database
+waits for it:
+
+```yaml
+depends_on:
+  db-migrate: { condition: service_completed_successfully }
+```
 
 ## Queues
 

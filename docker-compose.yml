@@ -6,8 +6,8 @@
 # The four services (ingest-api, triage-engine, verifier, rag-index) join this file as
 # each one is built. Images are pinned to a release line, never `latest`.
 #
-# Check it came up:  docker compose ps   (postgres and rabbitmq "healthy";
-# rabbitmq-topology "exited (0)" once it has loaded the queues)
+# Check it came up:  docker compose ps -a   (postgres and rabbitmq "healthy";
+# db-migrate and rabbitmq-topology "exited (0)" once the schema and queues are loaded)
 
 name: gridlock
 
@@ -34,6 +34,25 @@ services:
       interval: 5s
       timeout: 5s
       retries: 20
+
+  # Applies infra/postgres/migrations in order, once each, then exits. Every service that
+  # uses the database waits for it:
+  #   depends_on: { db-migrate: { condition: service_completed_successfully } }
+  db-migrate:
+    image: gridlock/postgres:17-3.5-pgvector   # built by the postgres service; has psql
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      PGHOST: postgres
+      PGDATABASE: gridlock
+      PGUSER: ${POSTGRES_USER}
+      PGPASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - ./infra/postgres/migrations:/migrations:ro
+      - ./infra/postgres/migrate.sh:/migrate.sh:ro
+    entrypoint: ["sh", "/migrate.sh"]
+    restart: "no"
 
   rabbitmq:
     image: rabbitmq:4.1-management
