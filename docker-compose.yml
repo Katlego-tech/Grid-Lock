@@ -46,7 +46,11 @@ services:
     volumes:
       - rabbitmqdata:/var/lib/rabbitmq
     healthcheck:
-      test: ["CMD", "rabbitmq-diagnostics", "-q", "check_port_connectivity"]
+      # As the rabbitmq user, never root. The image's HOME is the data directory and
+      # root's cookie is a link to the broker's, so a root CLI call that wins the race on
+      # first boot creates .erlang.cookie owned by root -- and the broker then dies with
+      # "Error when reading /var/lib/rabbitmq/.erlang.cookie: eacces".
+      test: ["CMD", "gosu", "rabbitmq", "rabbitmq-diagnostics", "-q", "check_port_connectivity"]
       interval: 5s
       timeout: 10s
       retries: 30
@@ -70,7 +74,8 @@ services:
       - sh
       - -c
       - >-
-        curl -fsS -u "$$RABBITMQ_DEFAULT_USER:$$RABBITMQ_DEFAULT_PASS"
+        curl -fsS --retry 10 --retry-all-errors --retry-delay 3
+        -u "$$RABBITMQ_DEFAULT_USER:$$RABBITMQ_DEFAULT_PASS"
         -H "content-type: application/json" -X POST
         --data-binary @/definitions.json http://rabbitmq:15672/api/definitions
         && echo "gridlock topology loaded"
