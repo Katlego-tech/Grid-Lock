@@ -235,9 +235,22 @@ class LocationConfidence(str, Enum):
 | Method | Path | Request | Response |
 | --- | --- | --- | --- |
 | POST | `/api/reports` | `{description: str (1..2000, non-blank), coords?: {lat, lon}, landmark?: str (≤200), category_hint?: str (≤100)}` | `202 {report_id: UUID, received_at: datetime}` · `422` on blank/oversize description |
-| GET | `/api/queue` | `?state=active\|needs_review&limit=50` (limit 1..200) | `200 {items: QueueItem[]}` — `active`: `TRIAGED` ordered tier → corroboration_count → age; `needs_review`: `NEEDS_REVIEW` plus `RECEIVED` older than 5s, oldest first · `422` on an unknown `state` |
+| GET | `/api/queue` | `?state=active\|needs_review&limit=50` (limit 1..200) | `200 {items: QueueItem[]}` — `active`: `TRIAGED` reports, **grouped by incident** (below); `needs_review`: `NEEDS_REVIEW` plus `RECEIVED` older than 5s, oldest first · `422` on an unknown `state` |
 | GET | `/api/reports/{id}` | — | `200 ReportDetail` · `404` |
 | POST | `/api/reports/{id}/acknowledge` | — | `200 {state: "ACKNOWLEDGED"}` · `404` · `409` if already `ACKNOWLEDGED` or `RESOLVED` |
+| POST | `/api/incidents/{id}/acknowledge` | — | `200 {state: "ACKNOWLEDGED", report_ids: UUID[]}` — every open report in the incident, in one guarded update · `404` · `409` if none is open |
+
+**Queue grouping (`state=active`).** The console shows **one card per incident**, so the server
+returns an incident's open reports next to each other and the console collapses each run into one
+card led by its first item. A report with no incident is a group of one.
+
+- Groups are ranked by: highest tier among the group's `TRIAGED` reports → `corroboration_count`
+  (descending) → oldest `received_at` in the group → group id (a stable tie-break).
+- Within a group: tier (highest first) → `received_at` (oldest first). The first item is the
+  card's lead: its `tier` and `reason` are what the card shows.
+- `limit` counts **groups**, never reports, so an incident is never cut in half.
+- `needs_review` is not grouped: failed and untriaged reports are not linked to incidents (see
+  `verification.md`), so every item there has `incident_id = null`.
 
 **HTTP — `rag-index` (internal, called by `triage-engine` only)**
 
@@ -257,6 +270,7 @@ class RetrievalResult(BaseModel):
 # QueueItem — exactly what the console renders; no extra fields, no fewer
 class QueueItem(BaseModel):
     report_id: UUID
+    incident_id: UUID | None     # groups the console's cards; None = a group of one
     tier: Tier | None            # None when not yet triaged, or triage failed
     reason: str | None           # None when not yet triaged, or triage failed
     corroboration_count: int     # >= 1; derived: COUNT of reports sharing incident_id, else 1
