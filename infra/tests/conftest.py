@@ -8,6 +8,7 @@ image is built from infra/postgres/Dockerfile, the same one docker compose build
 point the suite at servers you already run instead, set:
 
     GRIDLOCK_TEST_DATABASE_URL    a superuser DSN, e.g. postgresql://postgres@localhost:5432/postgres
+                                  (then migrate.sh runs locally, so sh and psql must be on PATH)
     GRIDLOCK_TEST_AMQP_URL        e.g. amqp://guest:guest@localhost:5672/%2F
     GRIDLOCK_TEST_RABBITMQ_API    e.g. http://guest:guest@localhost:15672
 
@@ -18,13 +19,17 @@ A check that did not run is a failed check.
 from __future__ import annotations
 
 import base64
+import contextlib
 import json
 import os
+import shutil
+import subprocess
+import tempfile
 import time
 import urllib.parse
 import urllib.request
 import uuid
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import LiteralString, cast
@@ -42,6 +47,7 @@ INFRA = Path(__file__).resolve().parent.parent
 POSTGRES_DIR = INFRA / "postgres"
 INIT_SQL = POSTGRES_DIR / "init.sql"
 MIGRATIONS = POSTGRES_DIR / "migrations"
+MIGRATE_SH = POSTGRES_DIR / "migrate.sh"
 DEFINITIONS = INFRA / "rabbitmq" / "definitions.json"
 
 # Kept in step with docker-compose.yml, so the suite tests what `compose up` runs.
@@ -64,12 +70,91 @@ def _wait_for_postgres(dsn: str, timeout_s: float = 60.0) -> None:
             time.sleep(0.5)
 
 
+@dataclass(frozen=True)
+class MigrateRun:
+    code: int
+    output: str
+
+
+# Run migrate.sh against the named database. `extra` adds migration files (name -> SQL)
+# to a copy of infra/postgres/migrations, so a test can try one that fails.
+Migrate = Callable[[str, dict[str, str] | None], MigrateRun]
+
+
+@dataclass(frozen=True)
+class PostgresServer:
+    dsn: str  # superuser, database `postgres`
+    run_migrate: Migrate
+
+    def migrate(self, dbname: str, extra: dict[str, str] | None = None) -> MigrateRun:
+        return self.run_migrate(dbname, extra)
+
+
+def _migrate_with_local_psql(dsn: str) -> Migrate:
+    """Run migrate.sh here, against an external server. Needs sh and psql on PATH."""
+    parts = urllib.parse.urlsplit(dsn)
+
+    def run(dbname: str, extra: dict[str, str] | None) -> MigrateRun:
+        with tempfile.TemporaryDirectory() as tmp:
+            migrations = MIGRATIONS
+            if extra:
+                migrations = Path(tmp)
+                for existing in MIGRATIONS.glob("*.sql"):
+                    shutil.copy(existing, migrations)
+                for name, body in extra.items():
+                    (migrations / name).write_text(body, encoding="utf-8")
+            env = {
+                **os.environ,
+                "PGHOST": parts.hostname or "localhost",
+                "PGPORT": str(parts.port or 5432),
+                "PGUSER": urllib.parse.unquote(parts.username or "postgres"),
+                "PGPASSWORD": urllib.parse.unquote(parts.password or ""),
+                "PGDATABASE": dbname,
+                "MIGRATIONS_DIR": str(migrations),
+            }
+            done = subprocess.run(
+                ["sh", str(MIGRATE_SH)], env=env, capture_output=True, text=True, check=False
+            )
+        return MigrateRun(done.returncode, done.stdout + done.stderr)
+
+    return run
+
+
+def _migrate_in_container(container: DockerContainer) -> Migrate:
+    """Run migrate.sh inside the Postgres container, as the compose db-migrate job does."""
+
+    def sh(script: str, *env: str) -> MigrateRun:
+        code, raw = container.exec(["env", *env, "sh", "-c", script])
+        # exec() returns the whole output as bytes unless asked to stream it.
+        output = raw.decode(errors="replace") if isinstance(raw, bytes) else ""
+        return MigrateRun(-1 if code is None else code, output)  # None: no exit code = failed
+
+    def run(dbname: str, extra: dict[str, str] | None) -> MigrateRun:
+        migrations = "/migrations"
+        if extra:
+            migrations = f"/tmp/migrations-{uuid.uuid4().hex[:8]}"
+            copy = [f"mkdir -p {migrations}", f"cp /migrations/*.sql {migrations}/"]
+            for name, body in extra.items():
+                encoded = base64.b64encode(body.encode()).decode()
+                copy.append(f"echo {encoded} | base64 -d > {migrations}/{name}")
+            prepared = sh(" && ".join(copy))
+            assert prepared.code == 0, prepared.output
+        return sh(
+            "sh /migrate.sh",
+            "PGUSER=postgres",
+            f"PGDATABASE={dbname}",
+            f"MIGRATIONS_DIR={migrations}",
+        )
+
+    return run
+
+
 @pytest.fixture(scope="session")
-def postgres_server() -> Iterator[str]:
-    """A superuser DSN for a PostGIS + pgvector server the suite may create databases on."""
+def postgres_server() -> Iterator[PostgresServer]:
+    """A PostGIS + pgvector server the suite may create databases on."""
     external = os.environ.get("GRIDLOCK_TEST_DATABASE_URL")
     if external:
-        yield external
+        yield PostgresServer(external, _migrate_with_local_psql(external))
         return
 
     with DockerImage(path=POSTGRES_DIR, tag=POSTGRES_TEST_TAG, clean_up=False) as image:
@@ -77,6 +162,8 @@ def postgres_server() -> Iterator[str]:
             DockerContainer(str(image))
             .with_env("POSTGRES_PASSWORD", "gridlock-test")
             .with_exposed_ports(5432)
+            .with_volume_mapping(str(MIGRATIONS), "/migrations", "ro")
+            .with_volume_mapping(str(MIGRATE_SH), "/migrate.sh", "ro")
             # The first "ready" line can come from the image's temporary init server, which
             # listens on its socket only; _wait_for_postgres below then waits for TCP, which
             # only the real server answers.
@@ -87,7 +174,7 @@ def postgres_server() -> Iterator[str]:
             port = container.get_exposed_port(5432)
             dsn = f"postgresql://postgres:gridlock-test@{host}:{port}/postgres"
             _wait_for_postgres(dsn)
-            yield dsn
+            yield PostgresServer(dsn, _migrate_in_container(container))
 
 
 def _with_dbname(dsn: str, dbname: str) -> str:
@@ -95,28 +182,37 @@ def _with_dbname(dsn: str, dbname: str) -> str:
     return urllib.parse.urlunsplit(parts._replace(path=f"/{dbname}"))
 
 
-@pytest.fixture(scope="session")
-def migrated_db(postgres_server: str) -> Iterator[str]:
-    """A fresh database set up as compose sets one up: init.sql, then every migration in
-    filename order. Dropped afterwards."""
+@contextlib.contextmanager
+def fresh_database(server: PostgresServer) -> Iterator[str]:
+    """A new, empty database with init.sql applied (what initdb does under compose).
+    Dropped afterwards. Returns its DSN."""
     dbname = f"gridlock_test_{uuid.uuid4().hex[:12]}"
-    with psycopg.connect(postgres_server, autocommit=True) as admin:
+    with psycopg.connect(server.dsn, autocommit=True) as admin:
         admin.execute(sql.SQL("CREATE DATABASE {}").format(sql.Identifier(dbname)))
-    dsn = _with_dbname(postgres_server, dbname)
+    dsn = _with_dbname(server.dsn, dbname)
     try:
-        scripts = [INIT_SQL, *sorted(MIGRATIONS.glob("*.sql"))]
         with psycopg.connect(dsn, autocommit=True) as conn:
-            for script in scripts:
-                # Committed SQL files are trusted, run as written -- the same thing
-                # Postgres' initdb does with them under docker compose.
-                ddl = cast(LiteralString, script.read_text(encoding="utf-8"))
-                conn.execute(ddl)
+            # Committed SQL, run as written -- as Postgres' initdb does with it.
+            conn.execute(cast(LiteralString, INIT_SQL.read_text(encoding="utf-8")))
         yield dsn
     finally:
-        with psycopg.connect(postgres_server, autocommit=True) as admin:
+        with psycopg.connect(server.dsn, autocommit=True) as admin:
             admin.execute(
                 sql.SQL("DROP DATABASE IF EXISTS {} WITH (FORCE)").format(sql.Identifier(dbname))
             )
+
+
+def dbname_of(dsn: str) -> str:
+    return urllib.parse.urlsplit(dsn).path.lstrip("/")
+
+
+@pytest.fixture(scope="session")
+def migrated_db(postgres_server: PostgresServer) -> Iterator[str]:
+    """A fresh database set up exactly as compose sets one up: init.sql, then migrate.sh."""
+    with fresh_database(postgres_server) as dsn:
+        run = postgres_server.migrate(dbname_of(dsn))
+        assert run.code == 0, f"migrate.sh failed ({run.code}):\n{run.output}"
+        yield dsn
 
 
 @pytest.fixture
