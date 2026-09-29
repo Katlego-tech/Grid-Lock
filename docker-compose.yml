@@ -1,0 +1,81 @@
+# The GridLock backing services, locally: PostgreSQL (PostGIS + pgvector) and RabbitMQ.
+#
+#   cp .env.example .env      # then set real local passwords
+#   docker compose up -d
+#
+# The four services (ingest-api, triage-engine, verifier, rag-index) join this file as
+# each one is built. Images are pinned to a release line, never `latest`.
+#
+# Check it came up:  docker compose ps   (postgres and rabbitmq "healthy";
+# rabbitmq-topology "exited (0)" once it has loaded the queues)
+
+name: gridlock
+
+services:
+  postgres:
+    # PostGIS + pgvector: infra/postgres/Dockerfile. Built once, then cached.
+    build: ./infra/postgres
+    image: gridlock/postgres:17-3.5-pgvector
+    environment:
+      POSTGRES_DB: gridlock
+      POSTGRES_USER: ${POSTGRES_USER:?set POSTGRES_USER in .env (see .env.example)}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env (see .env.example)}
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      # Runs once, when the data volume is first created: enables PostGIS and pgvector.
+      # To start again from nothing:  docker compose down -v && docker compose up -d
+      - ./infra/postgres/init.sql:/docker-entrypoint-initdb.d/00_init.sql:ro
+    healthcheck:
+      # -h 127.0.0.1, not the socket: while the init scripts run, the image's temporary
+      # server answers on the socket only. Healthy must mean "init has finished".
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U \"$$POSTGRES_USER\" -d gridlock"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  rabbitmq:
+    image: rabbitmq:4.1-management
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_DEFAULT_USER:?set RABBITMQ_DEFAULT_USER in .env (see .env.example)}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_DEFAULT_PASS:?set RABBITMQ_DEFAULT_PASS in .env (see .env.example)}
+    ports:
+      - "127.0.0.1:5672:5672"     # AMQP
+      - "127.0.0.1:15672:15672"   # management UI
+    volumes:
+      - rabbitmqdata:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "check_port_connectivity"]
+      interval: 5s
+      timeout: 10s
+      retries: 30
+
+  # Loads infra/rabbitmq/definitions.json through the management API, then exits.
+  #
+  # Not `load_definitions` in rabbitmq.conf: a broker that imports definitions at boot
+  # skips creating RABBITMQ_DEFAULT_USER, leaving no user anything can log in as.
+  # Importing is idempotent, so this is safe on every `up`.
+  rabbitmq-topology:
+    image: curlimages/curl:8.11.1
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_DEFAULT_USER}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_DEFAULT_PASS}
+    volumes:
+      - ./infra/rabbitmq/definitions.json:/definitions.json:ro
+    command:
+      - sh
+      - -c
+      - >-
+        curl -fsS -u "$$RABBITMQ_DEFAULT_USER:$$RABBITMQ_DEFAULT_PASS"
+        -H "content-type: application/json" -X POST
+        --data-binary @/definitions.json http://rabbitmq:15672/api/definitions
+        && echo "gridlock topology loaded"
+    restart: "no"
+
+volumes:
+  pgdata:
+  rabbitmqdata:

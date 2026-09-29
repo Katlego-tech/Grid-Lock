@@ -1,0 +1,91 @@
+{
+  "vhosts": [
+    {
+      "name": "/"
+    }
+  ],
+  "exchanges": [
+    {
+      "name": "gridlock",
+      "vhost": "/",
+      "type": "topic",
+      "durable": true,
+      "auto_delete": false,
+      "internal": false,
+      "arguments": {}
+    },
+    {
+      "name": "gridlock.dlx",
+      "vhost": "/",
+      "type": "fanout",
+      "durable": true,
+      "auto_delete": false,
+      "internal": false,
+      "arguments": {}
+    }
+  ],
+  "queues": [
+    {
+      "name": "triage.report_received",
+      "vhost": "/",
+      "durable": true,
+      "auto_delete": false,
+      "arguments": {
+        "x-queue-type": "quorum",
+        "x-delivery-limit": 2,
+        "x-dead-letter-exchange": "gridlock.dlx",
+        "x-dead-letter-strategy": "at-least-once",
+        "x-overflow": "reject-publish"
+      }
+    },
+    {
+      "name": "verifier.report_triaged",
+      "vhost": "/",
+      "durable": true,
+      "auto_delete": false,
+      "arguments": {
+        "x-queue-type": "quorum",
+        "x-delivery-limit": 2,
+        "x-dead-letter-exchange": "gridlock.dlx",
+        "x-dead-letter-strategy": "at-least-once",
+        "x-overflow": "reject-publish"
+      }
+    },
+    {
+      "name": "gridlock.dlq",
+      "vhost": "/",
+      "durable": true,
+      "auto_delete": false,
+      "arguments": {
+        "x-queue-type": "quorum",
+        "x-delivery-limit": -1
+      }
+    }
+  ],
+  "bindings": [
+    {
+      "source": "gridlock",
+      "vhost": "/",
+      "destination": "triage.report_received",
+      "destination_type": "queue",
+      "routing_key": "report.received",
+      "arguments": {}
+    },
+    {
+      "source": "gridlock",
+      "vhost": "/",
+      "destination": "verifier.report_triaged",
+      "destination_type": "queue",
+      "routing_key": "report.triaged",
+      "arguments": {}
+    },
+    {
+      "source": "gridlock.dlx",
+      "vhost": "/",
+      "destination": "gridlock.dlq",
+      "destination_type": "queue",
+      "routing_key": "",
+      "arguments": {}
+    }
+  ]
+}

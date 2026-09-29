@@ -90,12 +90,15 @@ docker-compose.yml     the whole system, locally
 
 ## Running it
 
-Not yet runnable — the services are being built. When they are:
+The backing services run now; the four services join `docker-compose.yml` as they are built.
 
 ```bash
 uv python install 3.13     # the project pins 3.13
-docker compose up -d       # broker, database, services
+cp .env.example .env       # set your own local passwords
+docker compose up -d       # PostgreSQL (PostGIS + pgvector), RabbitMQ, and the queue topology
 ```
+
+See [`infra/README.md`](infra/README.md) for ports, queues and dead-lettering.
 
 Requirements: Python 3.13, Node 24 LTS, Docker with Compose v2+.
 
@@ -209,6 +212,7 @@ a duplication check. A check that cannot run fails, so your machine needs:
 - a committed lockfile for every project (`uv lock`, or the package manager's own)
 - [`osv-scanner`](https://google.github.io/osv-scanner/installation/) on your `PATH`, and `npx`
   (it comes with Node) for the duplication check
+- Docker running, for `infra/`'s tests, which run against real Postgres and RabbitMQ
 
 A vulnerability with no fixed release yet is declared in `osv-scanner.toml` at the repo root, with
 its reason naming the follow-up that will close it (`T012: …` or `#12: …`). A deliberate copy of
