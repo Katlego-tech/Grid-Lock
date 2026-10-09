@@ -147,6 +147,17 @@ A schema disagreement should break a build, not a demo.
 Branch → PR into `main` → green CI → review → merge. No direct pushes to `main`. Commits are
 formatted `type(scope): short description`.
 
+GitHub enforces this on `main` with a repository ruleset (**Protect main**):
+
+- every change arrives through a pull request — a direct push is rejected by the server;
+- a PR needs one approving review from someone other than its author, and a push after that
+  approval needs a fresh one;
+- the `gate` CI check must pass before it can merge;
+- `main` cannot be force-pushed or deleted.
+
+The repository admin (the project lead) may merge their own PRs without an approval. That
+exception covers pull requests only — the admin cannot push to `main` directly either.
+
 ### Setting up your clone
 
 Do this once, immediately after cloning, before you write anything.
@@ -172,7 +183,7 @@ Self-test 2/2: what will the gate actually run here?
 ```
 
 If self-test 1 says `FAIL -- the hook allowed a push to main`, stop. Don't push anything until it
-passes; at that point you have no protection at all and neither does the branch.
+passes; until then your clone runs no checks before a push.
 
 **3. Verify it stuck.**
 
@@ -185,10 +196,10 @@ matter what step 1 appeared to say.
 
 **Why this is a script and not a sentence.** `core.hooksPath` lives in `.git/config`, and
 `.git/config` is **never cloned**. Hooks are not version-controlled state. So the person who set the
-repo up has the gate and nobody else does, silently, until they run this. There is no server-side
-branch protection on this repository — GitHub gates that behind a paid plan for private repos — so
-this hook is not a convenience, it is the only thing standing between a stray `git push` and `main`.
-CI cannot cover for it: CI runs *after* the ref has already moved, and reports. It cannot refuse.
+repo up has the gate and nobody else does, silently, until they run this. GitHub's ruleset now
+refuses a direct push to `main` on its own, so the hook is no longer the only barrier — but it is
+still the fast one: it runs the whole gate on your machine before a push, rather than letting you
+find out from a red CI run on the PR.
 
 If it is working, a push to `main` looks like this — this is the gate doing its job, not a bug:
 
