@@ -15,7 +15,7 @@ services:
   postgres:
     # PostGIS + pgvector: infra/postgres/Dockerfile. Built once, then cached.
     build: ./infra/postgres
-    image: gridlock/postgres:17-3.5-pgvector
+    image: gridlock/postgres:17-postgis3.6-pgvector0.8
     environment:
       POSTGRES_DB: gridlock
       POSTGRES_USER: ${POSTGRES_USER:?set POSTGRES_USER in .env (see .env.example)}
@@ -39,7 +39,7 @@ services:
   # uses the database waits for it:
   #   depends_on: { db-migrate: { condition: service_completed_successfully } }
   db-migrate:
-    image: gridlock/postgres:17-3.5-pgvector   # built by the postgres service; has psql
+    image: gridlock/postgres:17-postgis3.6-pgvector0.8   # built by the postgres service; has psql
     depends_on:
       postgres:
         condition: service_healthy

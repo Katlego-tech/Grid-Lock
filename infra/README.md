@@ -23,8 +23,8 @@ docker compose ps -a        # postgres + rabbitmq "healthy"; db-migrate + rabbit
 ```
 
 - **Postgres** listens on `localhost:5432`, database `gridlock`, with `postgis` and `vector`
-  enabled. The first `up` builds the image (`gridlock/postgres:17-3.5-pgvector`), which takes a
-  minute. `init.sql` runs only when the data volume is first created. To start again from
+  enabled. The first `up` builds the image (`gridlock/postgres:17-postgis3.6-pgvector0.8`), which
+  takes a minute. `init.sql` runs only when the data volume is first created. To start again from
   nothing, run `docker compose down -v && docker compose up -d`.
 - **RabbitMQ** listens on `localhost:5672`, with the management UI at <http://localhost:15672>
   (log in with the user and password from your `.env`). Once the broker is healthy, the
