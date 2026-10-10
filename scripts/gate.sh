@@ -503,9 +503,12 @@ committed_lockfile() {
 # missing lockfile fails here rather than letting the scan quietly cover less.
 collect_lockfiles() {
   local dir="$1" rel="$2" kind lock
-  is_workspace_root "$dir" && return 0   # its uv.lock is collected through its members
   for kind in py node; do
-    if [ "$kind" = py ]; then is_python_project "$dir" || continue
+    if [ "$kind" = py ]; then
+      is_python_project "$dir" || continue
+      # A uv workspace root's uv.lock is collected through its members. Only its Python
+      # side is skipped: the same root can be an npm workspace whose lockfile is its own.
+      is_workspace_root "$dir" && continue
     else [ -f "$dir/package.json" ] || continue
     fi
     if lock="$(committed_lockfile "$dir" "$kind")"; then

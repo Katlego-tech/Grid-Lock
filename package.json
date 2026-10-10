@@ -1,0 +1,16 @@
+{
+  "name": "gridlock",
+  "private": true,
+  "description": "npm workspace root: links @gridlock/contracts for the TypeScript clients. apps/web keeps its own lockfile until it joins.",
+  "engines": {
+    "node": "^24.15.0"
+  },
+  "workspaces": [
+    "packages/contracts/ts"
+  ],
+  "scripts": {
+    "lint": "npm run lint --workspaces",
+    "test": "npm test --workspaces",
+    "build": "npm run build --workspaces"
+  }
+}

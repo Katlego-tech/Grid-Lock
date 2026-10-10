@@ -1,0 +1,413 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "GridLockContract",
+  "description": "Any GridLock contract payload.",
+  "anyOf": [
+    {
+      "$ref": "#/$defs/Coordinates"
+    },
+    {
+      "$ref": "#/$defs/EvidenceChunk"
+    },
+    {
+      "$ref": "#/$defs/RetrievalResult"
+    },
+    {
+      "$ref": "#/$defs/QueueItem"
+    },
+    {
+      "$ref": "#/$defs/ReportReceived"
+    },
+    {
+      "$ref": "#/$defs/ReportTriaged"
+    },
+    {
+      "$ref": "#/$defs/ReportNeedsReview"
+    },
+    {
+      "$ref": "#/$defs/IncidentUpdated"
+    }
+  ],
+  "$defs": {
+    "Coordinates": {
+      "additionalProperties": false,
+      "description": "A WGS84 point. Off-globe values are refused here: PostGIS would quietly move them.",
+      "properties": {
+        "lat": {
+          "maximum": 90,
+          "minimum": -90,
+          "type": "number"
+        },
+        "lon": {
+          "maximum": 180,
+          "minimum": -180,
+          "type": "number"
+        }
+      },
+      "required": [
+        "lat",
+        "lon"
+      ],
+      "title": "Coordinates",
+      "type": "object"
+    },
+    "EvidenceChunk": {
+      "additionalProperties": false,
+      "description": "One retrieved landmark chunk, exactly as the model saw it (rag.md invariant 7).",
+      "properties": {
+        "landmark_id": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "text": {
+          "type": "string"
+        },
+        "similarity": {
+          "type": "number"
+        }
+      },
+      "required": [
+        "landmark_id",
+        "text",
+        "similarity"
+      ],
+      "title": "EvidenceChunk",
+      "type": "object"
+    },
+    "IncidentUpdated": {
+      "additionalProperties": false,
+      "description": "verifier -> nothing in the MVP (the console reads the database).",
+      "properties": {
+        "incident_id": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "grid_cell": {
+          "type": "string"
+        },
+        "report_count": {
+          "minimum": 1,
+          "type": "integer"
+        },
+        "peak_tier": {
+          "$ref": "#/$defs/Tier"
+        }
+      },
+      "required": [
+        "incident_id",
+        "grid_cell",
+        "report_count",
+        "peak_tier"
+      ],
+      "title": "IncidentUpdated",
+      "type": "object"
+    },
+    "LocationConfidence": {
+      "enum": [
+        "EXACT",
+        "RESOLVED",
+        "AMBIGUOUS",
+        "UNKNOWN"
+      ],
+      "title": "LocationConfidence",
+      "type": "string"
+    },
+    "QueueItem": {
+      "additionalProperties": false,
+      "description": "Exactly what the console renders; no extra fields, no fewer (domain-model section 6).",
+      "properties": {
+        "report_id": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "incident_id": {
+          "anyOf": [
+            {
+              "format": "uuid",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "tier": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Tier"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "reason": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "corroboration_count": {
+          "minimum": 1,
+          "type": "integer"
+        },
+        "grid_cell": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "location_confidence": {
+          "$ref": "#/$defs/LocationConfidence"
+        },
+        "state": {
+          "$ref": "#/$defs/ReportState"
+        },
+        "received_at": {
+          "format": "date-time",
+          "type": "string"
+        },
+        "description": {
+          "type": "string"
+        },
+        "failure_reason": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "report_id",
+        "incident_id",
+        "tier",
+        "reason",
+        "corroboration_count",
+        "grid_cell",
+        "location_confidence",
+        "state",
+        "received_at",
+        "description",
+        "failure_reason"
+      ],
+      "title": "QueueItem",
+      "type": "object"
+    },
+    "ReportNeedsReview": {
+      "additionalProperties": false,
+      "description": "triage-engine -> nothing in the MVP (the console reads the database).",
+      "properties": {
+        "report_id": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "failure_reason": {
+          "type": "string"
+        },
+        "triaged_at": {
+          "format": "date-time",
+          "type": "string"
+        }
+      },
+      "required": [
+        "report_id",
+        "failure_reason",
+        "triaged_at"
+      ],
+      "title": "ReportNeedsReview",
+      "type": "object"
+    },
+    "ReportReceived": {
+      "additionalProperties": false,
+      "description": "ingest-api -> triage-engine, once the report is persisted.",
+      "properties": {
+        "report_id": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "description": {
+          "maxLength": 2000,
+          "minLength": 1,
+          "type": "string"
+        },
+        "reported_coords": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Coordinates"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "reported_landmark": {
+          "anyOf": [
+            {
+              "maxLength": 200,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "category_hint": {
+          "anyOf": [
+            {
+              "maxLength": 100,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "received_at": {
+          "format": "date-time",
+          "type": "string"
+        }
+      },
+      "required": [
+        "report_id",
+        "description",
+        "reported_coords",
+        "reported_landmark",
+        "category_hint",
+        "received_at"
+      ],
+      "title": "ReportReceived",
+      "type": "object"
+    },
+    "ReportState": {
+      "enum": [
+        "RECEIVED",
+        "TRIAGED",
+        "NEEDS_REVIEW",
+        "ACKNOWLEDGED",
+        "RESOLVED"
+      ],
+      "title": "ReportState",
+      "type": "string"
+    },
+    "ReportTriaged": {
+      "additionalProperties": false,
+      "description": "triage-engine -> verifier, after a successful triage.",
+      "properties": {
+        "report_id": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "tier": {
+          "$ref": "#/$defs/Tier"
+        },
+        "grid_cell": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "resolved_coords": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Coordinates"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "location_confidence": {
+          "$ref": "#/$defs/LocationConfidence"
+        },
+        "triaged_at": {
+          "format": "date-time",
+          "type": "string"
+        }
+      },
+      "required": [
+        "report_id",
+        "tier",
+        "grid_cell",
+        "resolved_coords",
+        "location_confidence",
+        "triaged_at"
+      ],
+      "title": "ReportTriaged",
+      "type": "object"
+    },
+    "RetrievalResult": {
+      "additionalProperties": false,
+      "description": "rag-index's answer to POST /internal/rag/retrieve (rag.md sections 3 and 7).",
+      "properties": {
+        "status": {
+          "$ref": "#/$defs/LocationConfidence"
+        },
+        "grid_cell": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "resolved_coords": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Coordinates"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "evidence": {
+          "items": {
+            "$ref": "#/$defs/EvidenceChunk"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "status",
+        "grid_cell",
+        "resolved_coords",
+        "evidence"
+      ],
+      "title": "RetrievalResult",
+      "type": "object"
+    },
+    "Tier": {
+      "enum": [
+        "MONITOR",
+        "ADVISORY",
+        "URGENT",
+        "CRITICAL_DISPATCH"
+      ],
+      "title": "Tier",
+      "type": "string"
+    }
+  }
+}

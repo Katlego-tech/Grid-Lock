@@ -19,9 +19,15 @@ from gridlock_contracts.enums import LocationConfidence, ReportState, Tier
 
 
 class ContractModel(BaseModel):
-    """Base for every contract: unknown fields and non-finite numbers are refused."""
+    """Base for every contract: unknown fields and non-finite numbers are refused.
 
-    model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
+    A field with a default is still always present in what a model sends, so its JSON
+    Schema marks it required: a TypeScript client never has to guess it might be missing.
+    """
+
+    model_config = ConfigDict(
+        extra="forbid", allow_inf_nan=False, json_schema_serialization_defaults_required=True
+    )
 
 
 def _canonical_cell(value: str) -> str:

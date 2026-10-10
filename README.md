@@ -102,6 +102,7 @@ For development, install every project's dependencies from the committed lockfil
 
 ```bash
 uv sync --all-packages --all-groups   # the Python workspace: one uv.lock, one .venv
+npm ci                                # the npm workspace: @gridlock/contracts' TypeScript types
 (cd apps/web && npm ci)               # the responder console (Node 24, per .nvmrc)
 bash scripts/gate.sh                  # everything CI runs, locally
 ```
