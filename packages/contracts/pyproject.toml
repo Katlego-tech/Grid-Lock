@@ -42,5 +42,5 @@ known-first-party = ["gridlock_contracts"]
 
 [tool.pyright]
 pythonVersion = "3.13"
-include = ["gridlock_contracts", "tests"]
+include = ["gridlock_contracts", "scripts", "tests"]
 typeCheckingMode = "strict"
