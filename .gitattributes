@@ -7,3 +7,7 @@
 
 *.sh      text eol=lf
 .githooks/* text eol=lf
+
+# A prompt's version is the SHA-256 of its raw bytes (triage.md section 6.2). LF on every
+# clone, so the same prompt has the same version everywhere.
+*.prompt  text eol=lf
