@@ -1,8 +1,9 @@
 /*
  * GridLock design tokens: the one set both surfaces read from.
  * apps/web (responder console) and apps/mobile (reporter app) derive their theme from these values.
- * Where the file finally lives, and how React Native consumes it, is decided in
- * responder-console.md (T006). Until then this file is the reference.
+ * This file is the single source: apps/web imports it from here, never a copy
+ * (responder-console.md section 6.4). How React Native consumes it is decided in
+ * reporter-app.md (T008).
  *
  * The colour language comes from South African road signage: red for danger, amber for
  * warning, blue for information, green for guidance. Tier colours mark rails, dots and chips.

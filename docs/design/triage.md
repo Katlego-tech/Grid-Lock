@@ -138,7 +138,7 @@ sequenceDiagram
         C->>DB: one transaction: INSERT triage_results (success shape) + guarded UPDATE → TRIAGED
         C->>OUT: publish report.triaged (confirm)
     else timeout or provider error
-        C->>DB: one transaction: INSERT triage_results (failure shape, "model timeout or error") + guarded UPDATE → NEEDS_REVIEW
+        C->>DB: one transaction: INSERT triage_results (failure shape, failure_reason per §6.4) + guarded UPDATE → NEEDS_REVIEW
         C->>OUT: publish report.needs_review (confirm)
     else output fails validation
         C->>DB: one transaction: INSERT triage_results (failure shape, raw output kept) + guarded UPDATE → NEEDS_REVIEW
@@ -276,6 +276,21 @@ from it. Worked examples, which become test cases (§9):
 | "guys climbing into the spaza shop roof right now" | `URGENT` | 2 (non-residential, in progress) |
 | "my car window was smashed overnight, radio gone" | `ADVISORY` | 3 (after the fact) |
 | "streetlight out on the corner since Tuesday" | `MONITOR` | 4 |
+
+### 6.4 `failure_reason` values
+
+A failure-shape result's `failure_reason` is exactly one of these. The responder console turns
+each into its Needs-review headline ([responder-console.md](responder-console.md) §6.3), so a new
+kind of failure is added here first, with its headline there, in the same PR.
+
+| Failure (§4 matrix) | `failure_reason` | Example |
+| --- | --- | --- |
+| Model call exceeds 2.4s | `model timed out` | `model timed out` |
+| Provider raises | `model error: <exception class name>` | `model error: RateLimitError` |
+| Output does not parse into `TriageChainOutput` | `invalid model output: <raw output>` | `invalid model output: {"tier": "HIGH", …}` |
+
+The exception's class name only, never its message: provider messages can carry request ids or
+prompt text. The raw output is kept whole: it is the evidence that no tier was invented.
 
 ---
 
