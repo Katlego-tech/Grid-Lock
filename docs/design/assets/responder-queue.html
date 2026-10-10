@@ -115,6 +115,25 @@
   .empty-main p.checked { font-size: 14px; color: var(--gl-ink-muted); margin-top: 18px; }
   .empty-main p.checked time { font-family: var(--gl-font-mono); }
   .review .none { padding: 18px; font-size: 16px; }
+
+  /* ---- connection lost ---- */
+  .live.offline { color: #fff; }
+  .live.offline .dot { background: var(--gl-tier-critical); box-shadow: 0 0 0 4px rgba(215,38,30,.28); }
+  .live.offline b { font-weight: 700; }
+  .notice { display: flex; gap: 14px; align-items: baseline; background: var(--gl-surface); border: 1px solid var(--gl-rule); border-left: 6px solid var(--gl-tier-critical); border-radius: var(--gl-radius); padding: 12px 16px; margin-bottom: 14px; font-size: 15px; line-height: 1.45; }
+  .notice strong { white-space: nowrap; }
+  .notice time { font-family: var(--gl-font-mono); font-size: 14px; }
+  .ackerr { grid-column: 1 / -1; font-size: 14px; font-weight: 700; color: var(--gl-tier-critical); }
+
+  /* ---- phone: needs review open, and empty ---- */
+  .phone .review { border-radius: 0; border-width: 0 0 1px; }
+  .phone .review .ritem { padding: 12px 14px 14px; }
+  .phone .review .foot { flex-wrap: wrap; gap: 8px; }
+  .phone .review .foot .ack { width: 100%; }
+  .strip.zero strong { font-size: 18px; }
+  .phone .empty-main { margin: 12px; padding: 26px 20px; }
+  .phone .empty-main h2 { font-size: 28px; }
+  .phone .empty-main p { font-size: 16px; }
 </style>
 </head>
 <body>
@@ -217,7 +236,7 @@
                   <div class="meta">
                     <span class="count"><span class="dots"><i></i></span>1 report</span>
                     <span class="age">34 min<time>21:14</time></span>
-                    <span class="loc">Ambiguous: matched 2 places</span>
+                    <span class="loc">Ambiguous: matched more than one place</span>
                   </div>
                 </div>
                 <button class="ack">Acknowledge</button>
@@ -310,6 +329,7 @@
               <div class="meta">
                 <span class="count"><span class="dots"><i></i><i></i></span>2 reports</span>
                 <span class="age">9 min<time>21:39</time></span>
+                <span class="loc">Matched a landmark</span>
               </div>
             </article>
           </div>
@@ -340,6 +360,135 @@
           <header><h2>Needs review <b>0</b></h2></header>
           <p class="none">Nothing is waiting for review.</p>
         </aside>
+      </div>
+    </div>
+  </div>
+  <!-- ============ E: phone, needs review shown ============ -->
+  <div>
+    <p class="frame-label"><b>E</b>Needs review shown — 375 px</p>
+    <div class="frame phone">
+      <div class="bar">
+        <div class="mark"><svg><use href="#hex"/></svg>GridLock</div>
+        <div class="live"><span class="dot"></span>Live <time>21:48</time></div>
+      </div>
+      <div class="strip">
+        <div class="hatch"></div>
+        <div><strong>2 need review</strong><p>Not ranked · oldest 7 min</p></div>
+        <button>Hide</button>
+      </div>
+      <div class="review">
+        <div class="ritem">
+          <p class="why"><span>Couldn't rank: the triage model timed out</span><span>7 min</span></p>
+          <blockquote><q>please send someone the old man at no 9 is shouting for help</q></blockquote>
+          <div class="foot"><span class="loc none">Location unknown</span><button class="ack">Acknowledge</button></div>
+        </div>
+        <div class="ritem">
+          <p class="why"><span>Waiting for triage</span><span>20 s</span></p>
+          <blockquote><q>there's smoke coming from the house behind the tavern, I can't see anyone</q></blockquote>
+          <div class="foot"><span class="loc none">Location not checked yet</span><button class="ack">Acknowledge</button></div>
+        </div>
+      </div>
+      <div class="phone-body">
+        <section class="hband t-critical">
+          <h2><span>Critical dispatch</span><span>2</span></h2>
+          <div class="cards">
+            <article class="card">
+              <p class="reason">Reporter says men are breaking through their back gate at 14 Sisulu Street while the family is inside.</p>
+              <div class="meta">
+                <span class="count"><span class="dots"><i></i><i></i><i></i></span>3 reports</span>
+                <span class="age">6 min<time>21:42</time></span>
+                <span class="loc">Phone GPS</span>
+              </div>
+            </article>
+          </div>
+        </section>
+      </div>
+    </div>
+  </div>
+</div>
+<div class="row">
+  <!-- ============ D: desk, connection lost ============ -->
+  <div>
+    <p class="frame-label"><b>D</b>Connection lost, and an acknowledge that failed — desk, 1440 px wide</p>
+    <div class="frame desk">
+      <div class="bar">
+        <div class="mark"><svg><use href="#hex"/></svg>GridLock</div>
+        <h1>Responder queue</h1>
+        <div class="tally" aria-label="Open reports by tier">
+          <span><i style="background:var(--gl-tier-critical)"></i><em>CRIT</em>1</span>
+          <span><i style="background:var(--gl-tier-urgent)"></i><em>URG</em>1</span>
+        </div>
+        <div class="live offline"><span class="dot"></span><b>Offline</b> · last updated 41 s ago <time>21:48</time></div>
+      </div>
+      <div class="desk-body">
+        <main>
+          <p class="notice"><strong>Can't reach GridLock.</strong><span>This list is from <time>21:48:12</time> and may be out of date. Reports sent since then are not shown. Retrying every 2 seconds.</span></p>
+          <section class="band t-critical">
+            <h2 class="spine"><span>Critical dispatch</span><b>1</b></h2>
+            <div class="cards">
+              <article class="card">
+                <div>
+                  <p class="reason">Reporter says armed men are forcing the back door while they and their children are inside.</p>
+                  <div class="meta">
+                    <span class="count"><span class="dots"><i></i></span>1 report</span>
+                    <span class="age">18 min<time>21:30</time></span>
+                    <span class="loc none">Location unknown</span>
+                  </div>
+                </div>
+                <button class="ack primary">Acknowledge</button>
+                <p class="ackerr" role="alert">Not acknowledged: GridLock couldn't be reached. Try again.</p>
+              </article>
+            </div>
+          </section>
+          <section class="band t-urgent">
+            <h2 class="spine"><span>Urgent</span><b>1</b></h2>
+            <div class="cards">
+              <article class="card">
+                <div>
+                  <p class="reason">A break-in is in progress at a house the reporter says is empty; the owners are overseas.</p>
+                  <div class="meta">
+                    <span class="count"><span class="dots"><i></i></span>1 report</span>
+                    <span class="age">2 min<time>21:46</time></span>
+                    <span class="loc none">Location unknown</span>
+                  </div>
+                </div>
+                <button class="ack">Acknowledge</button>
+              </article>
+            </div>
+          </section>
+        </main>
+        <aside class="review">
+          <div class="hatch"></div>
+          <header>
+            <h2>Needs review <b>1</b></h2>
+            <p>Not ranked. GridLock couldn't assign a tier, so read these yourself.</p>
+          </header>
+          <div class="ritem">
+            <p class="why"><span>Couldn't rank: the model's answer wasn't one of the four tiers</span><span>4 min</span></p>
+            <blockquote><q>gunshots near the taxi rank, two cars speeding off toward the bridge</q></blockquote>
+            <div class="foot"><span class="loc">Phone GPS · <code>89bcc3cc96bffff</code></span><button class="ack">Acknowledge</button></div>
+          </div>
+        </aside>
+      </div>
+    </div>
+  </div>
+
+  <!-- ============ F: phone, empty ============ -->
+  <div>
+    <p class="frame-label"><b>F</b>Queue, empty — 375 px</p>
+    <div class="frame phone">
+      <div class="bar">
+        <div class="mark"><svg><use href="#hex"/></svg>GridLock</div>
+        <div class="live"><span class="dot"></span>Live <time>04:12</time></div>
+      </div>
+      <div class="strip zero">
+        <div class="hatch"></div>
+        <div><strong>Nothing needs review</strong></div>
+      </div>
+      <div class="empty-main">
+        <h2>No open reports</h2>
+        <p>New reports appear here, ranked by tier, within 5 seconds of being sent. Reports you acknowledge leave this list.</p>
+        <p class="checked">Last checked <time>04:12:31</time></p>
       </div>
     </div>
   </div>

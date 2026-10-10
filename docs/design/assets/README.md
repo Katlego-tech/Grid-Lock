@@ -6,14 +6,14 @@ source never disagree.
 
 | Image | Source | Built against it |
 | --- | --- | --- |
-| `responder-queue.png` | `responder-queue.html` | `apps/web`, the responder console (`responder-console.md`) |
+| `responder-queue.png` | `responder-queue.html` | `apps/web`, the responder console (`responder-console.md`). Frames: A desk populated · B 375 px populated · C desk empty · D desk, connection lost and a failed acknowledge · E 375 px, Needs review shown · F 375 px empty |
 
 `tokens.css` is GridLock's one token set (colour, type, space). Both client surfaces derive their
 theme from it.
 
 ## Re-rendering
 
-Any Chromium at a 1936 px viewport, full-page capture, with the three Google Fonts loaded
+Any Chromium (Puppeteer or Playwright) at a 1936 px viewport, full-page capture, with the three Google Fonts loaded
 (Atkinson Hyperlegible, Barlow Condensed, IBM Plex Mono). For example, with Puppeteer:
 
 ```js
