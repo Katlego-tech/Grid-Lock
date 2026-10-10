@@ -1,0 +1,279 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Reporter app — visual reference</title>
+<!-- Source for reporter-app.png (T009). Render: see docs/design/assets/README.md. -->
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Atkinson+Hyperlegible:wght@400;700&family=Barlow+Condensed:wght@500;600;700&family=IBM+Plex+Mono:wght@400;500&display=block" rel="stylesheet">
+<link rel="stylesheet" href="tokens.css">
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { background: #9aa4aa; font-family: var(--gl-font-body); color: var(--gl-ink); width: 1936px; padding: 40px 40px 48px; }
+  button { font: inherit; color: inherit; background: none; border: 0; cursor: pointer; }
+
+  /* ---- board ---- */
+  .row { display: flex; gap: 40px; align-items: flex-start; }
+  .row + .row { margin-top: 44px; }
+  .frame-label { font-family: var(--gl-font-mono); font-size: 13px; color: #1d262e; margin-bottom: 10px; letter-spacing: .02em; width: 375px; }
+  .frame-label b { font-weight: 500; background: var(--gl-ink); color: #fff; padding: 2px 7px; border-radius: 3px; margin-right: 8px; }
+  .phone { width: 375px; height: 812px; border-radius: 28px; border: 8px solid var(--gl-ink); background: var(--gl-concrete); overflow: hidden; display: flex; flex-direction: column; box-shadow: 0 1px 0 rgba(0,0,0,.08), 0 18px 40px -18px rgba(15,23,32,.45); }
+
+  /* ---- app bar ---- */
+  .bar { background: var(--gl-ink); color: #fff; display: flex; align-items: center; justify-content: space-between; padding: 0 16px; height: 52px; flex: none; }
+  .mark { display: flex; align-items: center; gap: 10px; font-family: var(--gl-font-display); font-weight: 700; font-size: 22px; letter-spacing: .01em; }
+  .mark svg { width: 20px; height: 22px; }
+  .bar .net { font-size: 13px; color: #b8c2ca; display: flex; align-items: center; gap: 8px; }
+  .bar .net i { width: 9px; height: 9px; border-radius: 50%; background: #4cc38a; }
+  .bar .net.off i { background: var(--gl-unranked-b); }
+  .bar .net.off { color: #fff; }
+
+  /* ---- emergency line: always first, always one tap ---- */
+  .sos { display: flex; align-items: center; justify-content: space-between; gap: 12px; background: var(--gl-surface); border-bottom: 1px solid var(--gl-rule); padding: 8px 12px 8px 16px; font-size: 14px; flex: none; }
+  .sos a { display: inline-flex; align-items: center; min-height: var(--gl-hit); padding: 0 14px; border-radius: var(--gl-radius); border: 1.5px solid var(--gl-tier-critical); color: var(--gl-tier-critical); font-weight: 700; font-size: 15px; text-decoration: none; white-space: nowrap; }
+  .sos a span { font-family: var(--gl-font-mono); font-weight: 500; margin-left: 6px; }
+
+  /* ---- compose ---- */
+  .body { flex: 1; padding: 18px 16px 0; display: flex; flex-direction: column; gap: 18px; overflow: hidden; }
+  h2.q { font-family: var(--gl-font-display); font-weight: 700; font-size: 28px; letter-spacing: .02em; line-height: 1; }
+  .field { display: grid; gap: 6px; }
+  .field label, .legend { font-size: 15px; font-weight: 700; }
+  .textarea { background: var(--gl-surface); border: 1.5px solid var(--gl-rule); border-radius: var(--gl-radius); min-height: 150px; padding: 12px 14px; font-size: 17px; line-height: 1.45; }
+  .textarea.focus { border-color: var(--gl-ink); outline: 3px solid var(--gl-focus); outline-offset: 1px; }
+  .textarea .ph { color: var(--gl-ink-muted); }
+  .textarea .caret { display: inline-block; width: 2px; height: 20px; background: var(--gl-ink); vertical-align: -4px; margin-left: 1px; }
+  .count { font-family: var(--gl-font-mono); font-size: 12px; color: var(--gl-ink-muted); justify-self: end; }
+
+  .opts { display: grid; gap: 8px; }
+  .opt { background: var(--gl-surface); border: 1.5px solid var(--gl-rule); border-radius: var(--gl-radius); padding: 12px 14px; display: grid; grid-template-columns: 22px 1fr; gap: 2px 12px; min-height: var(--gl-hit); align-items: start; }
+  .opt .radio { width: 22px; height: 22px; border-radius: 50%; border: 2px solid var(--gl-ink-muted); margin-top: 1px; }
+  .opt.on { border-color: var(--gl-ink); box-shadow: inset 0 0 0 1px var(--gl-ink); }
+  .opt.on .radio { border-color: var(--gl-ink); background: radial-gradient(circle, var(--gl-ink) 0 5px, transparent 6px); }
+  .opt strong { font-size: 16px; }
+  .opt p { grid-column: 2; font-size: 14px; color: var(--gl-ink-muted); line-height: 1.4; }
+  .opt .status { grid-column: 2; margin-top: 6px; font-size: 14px; display: flex; align-items: center; gap: 8px; color: var(--gl-ink); font-weight: 700; }
+  .opt .status i { width: 9px; height: 9px; border-radius: 50%; background: var(--gl-tier-monitor); flex: none; }
+  .opt .status.warn { font-weight: 400; display: block; background: var(--gl-surface-sunk); border-left: 4px solid var(--gl-unranked-b); padding: 8px 10px; border-radius: 3px; line-height: 1.4; }
+  .opt .status.warn b { display: block; }
+  .opt .status.warn a { color: var(--gl-ink); font-weight: 700; text-underline-offset: 3px; display: inline-block; margin-top: 4px; }
+  .input { grid-column: 2; margin-top: 8px; background: #fff; border: 1.5px solid var(--gl-rule); border-radius: var(--gl-radius); min-height: var(--gl-hit); padding: 11px 12px; font-size: 16px; }
+  .input .ph { color: var(--gl-ink-muted); }
+  .input.focus { border-color: var(--gl-ink); outline: 3px solid var(--gl-focus); outline-offset: 1px; }
+  .hint { font-size: 14px; color: var(--gl-ink-muted); }
+
+  .foot { flex: none; padding: 12px 16px 16px; background: var(--gl-concrete); border-top: 1px solid var(--gl-rule); }
+  .send { width: 100%; min-height: 52px; border-radius: var(--gl-radius); background: var(--gl-ink); color: #fff; font-weight: 700; font-size: 17px; }
+  .send[disabled] { background: #b9c2c8; color: #eef1f2; }
+  .send.ghost { background: var(--gl-surface); color: var(--gl-ink); border: 1.5px solid var(--gl-ink); }
+
+  /* ---- outcomes ---- */
+  .hatch { height: 10px; background: repeating-linear-gradient(-45deg, var(--gl-unranked-a) 0 10px, var(--gl-unranked-b) 10px 20px); flex: none; }
+  .panel { background: var(--gl-surface); border: 1px solid var(--gl-rule); border-radius: var(--gl-radius); overflow: hidden; }
+  .panel .in { padding: 16px 16px 18px; display: grid; gap: 10px; }
+  .panel h3 { font-family: var(--gl-font-display); font-weight: 700; font-size: 26px; letter-spacing: .03em; text-transform: uppercase; line-height: 1.05; }
+  .panel p { font-size: 16px; line-height: 1.45; }
+  .panel .muted { color: var(--gl-ink-muted); font-size: 14px; }
+  .panel .muted time { font-family: var(--gl-font-mono); font-size: 13px; }
+  blockquote { background: var(--gl-surface-sunk); border-radius: 4px; padding: 10px 12px; font-size: 15px; line-height: 1.45; }
+  q { quotes: "\201C" "\201D"; }
+  .ok-rule { height: 10px; background: var(--gl-tier-monitor); }
+  .ref { display: grid; gap: 6px; }
+  .ref .label { font-size: 13px; font-weight: 700; text-transform: uppercase; letter-spacing: .06em; color: var(--gl-ink-muted); }
+  .ref .id { display: flex; align-items: center; justify-content: space-between; gap: 10px; background: var(--gl-surface-sunk); border-radius: 4px; padding: 8px 8px 8px 12px; }
+  .ref code { font-family: var(--gl-font-mono); font-size: 15px; line-height: 1.35; }
+  .ref button { min-height: var(--gl-hit); padding: 0 14px; border: 1.5px solid var(--gl-ink); border-radius: var(--gl-radius); font-weight: 700; font-size: 15px; background: var(--gl-surface); flex: none; }
+  .err-rule { height: 10px; background: var(--gl-tier-critical); }
+  .meta-line { font-size: 14px; color: var(--gl-ink-muted); display: flex; gap: 6px 16px; flex-wrap: wrap; }
+</style>
+</head>
+<body>
+
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+  <symbol id="hex" viewBox="0 0 22 24"><path d="M11 1.5 20.5 7v10L11 22.5 1.5 17V7z" fill="none" stroke="currentColor" stroke-width="2.4"/><path d="M11 8.2 15.2 10.6v4.8L11 17.8l-4.2-2.4v-4.8z" fill="currentColor"/></symbol>
+</svg>
+
+<div class="row">
+  <!-- ============ A: compose, empty ============ -->
+  <div>
+    <p class="frame-label"><b>A</b>Compose, empty</p>
+    <div class="phone">
+      <div class="bar"><div class="mark"><svg><use href="#hex"/></svg>GridLock</div></div>
+      <div class="sos"><span>In danger right now?</span><a href="#">Call SAPS<span>10111</span></a></div>
+      <div class="body">
+        <h2 class="q">What's happening?</h2>
+        <div class="field">
+          <label>Describe it</label>
+          <div class="textarea focus"><span class="caret"></span><span class="ph">What you see, where, and whether anyone is hurt.</span></div>
+          <span class="count">0 / 2000</span>
+        </div>
+        <div class="field">
+          <p class="legend">Where is it?</p>
+          <div class="opts">
+            <div class="opt"><span class="radio"></span><strong>I'm there now</strong><p>Send my phone's location</p></div>
+            <div class="opt"><span class="radio"></span><strong>Somewhere else</strong><p>I'll name the street or place</p></div>
+          </div>
+          <p class="hint">You can send without a location.</p>
+        </div>
+      </div>
+      <div class="foot"><button class="send" disabled>Send report</button></div>
+    </div>
+  </div>
+
+  <!-- ============ B: compose, filled, location attached ============ -->
+  <div>
+    <p class="frame-label"><b>B</b>Compose — location attached</p>
+    <div class="phone">
+      <div class="bar"><div class="mark"><svg><use href="#hex"/></svg>GridLock</div></div>
+      <div class="sos"><span>In danger right now?</span><a href="#">Call SAPS<span>10111</span></a></div>
+      <div class="body">
+        <h2 class="q">What's happening?</h2>
+        <div class="field">
+          <label>Describe it</label>
+          <div class="textarea">Men breaking through my back gate, 14 Sisulu Street. We are inside.</div>
+          <span class="count">68 / 2000</span>
+        </div>
+        <div class="field">
+          <p class="legend">Where is it?</p>
+          <div class="opts">
+            <div class="opt on"><span class="radio"></span><strong>I'm there now</strong><p>Send my phone's location</p>
+              <span class="status"><i></i>Your phone's location will be sent</span></div>
+            <div class="opt"><span class="radio"></span><strong>Somewhere else</strong><p>I'll name the street or place</p></div>
+          </div>
+        </div>
+      </div>
+      <div class="foot"><button class="send">Send report</button></div>
+    </div>
+  </div>
+
+  <!-- ============ C: location denied ============ -->
+  <div>
+    <p class="frame-label"><b>C</b>Location permission denied</p>
+    <div class="phone">
+      <div class="bar"><div class="mark"><svg><use href="#hex"/></svg>GridLock</div></div>
+      <div class="sos"><span>In danger right now?</span><a href="#">Call SAPS<span>10111</span></a></div>
+      <div class="body">
+        <h2 class="q">What's happening?</h2>
+        <div class="field">
+          <label>Describe it</label>
+          <div class="textarea">Two guys climbing onto the roof of the spaza shop to get in</div>
+          <span class="count">59 / 2000</span>
+        </div>
+        <div class="field">
+          <p class="legend">Where is it?</p>
+          <div class="opts">
+            <div class="opt on"><span class="radio"></span><strong>I'm there now</strong><p>Send my phone's location</p>
+              <span class="status warn"><b>Location is off for GridLock.</b>Name the place below, or turn location on and try again.<br><a href="#">Open Settings</a></span>
+              <div class="input focus"><span class="ph">Street, shop, school or landmark</span></div></div>
+            <div class="opt"><span class="radio"></span><strong>Somewhere else</strong><p>I'll name the street or place</p></div>
+          </div>
+        </div>
+      </div>
+      <div class="foot"><button class="send">Send report</button></div>
+    </div>
+  </div>
+
+  <!-- ============ D: location unavailable ============ -->
+  <div>
+    <p class="frame-label"><b>D</b>Location allowed, but no fix</p>
+    <div class="phone">
+      <div class="bar"><div class="mark"><svg><use href="#hex"/></svg>GridLock</div></div>
+      <div class="sos"><span>In danger right now?</span><a href="#">Call SAPS<span>10111</span></a></div>
+      <div class="body">
+        <h2 class="q">What's happening?</h2>
+        <div class="field">
+          <label>Describe it</label>
+          <div class="textarea">Smoke coming from the house behind the tavern, can't see anyone</div>
+          <span class="count">63 / 2000</span>
+        </div>
+        <div class="field">
+          <p class="legend">Where is it?</p>
+          <div class="opts">
+            <div class="opt on"><span class="radio"></span><strong>I'm there now</strong><p>Send my phone's location</p>
+              <span class="status warn"><b>Couldn't find your location.</b>Name the place below. Your report won't wait for a location.</span>
+              <div class="input">Behind the Mzansi tavern, Mofolo North</div></div>
+            <div class="opt"><span class="radio"></span><strong>Somewhere else</strong><p>I'll name the street or place</p></div>
+          </div>
+        </div>
+      </div>
+      <div class="foot"><button class="send">Send report</button></div>
+    </div>
+  </div>
+</div>
+
+<div class="row">
+  <!-- ============ E: queued offline ============ -->
+  <div>
+    <p class="frame-label"><b>E</b>No signal — saved, not sent yet</p>
+    <div class="phone">
+      <div class="bar"><div class="mark"><svg><use href="#hex"/></svg>GridLock</div><span class="net off"><i></i>No signal</span></div>
+      <div class="sos"><span>In danger right now?</span><a href="#">Call SAPS<span>10111</span></a></div>
+      <div class="body">
+        <div class="panel">
+          <div class="hatch"></div>
+          <div class="in">
+            <h3>Not sent yet</h3>
+            <p>Your phone has no signal. GridLock saved this report and sends it as soon as you're back online.</p>
+            <blockquote><q>Men breaking through my back gate, 14 Sisulu Street. We are inside.</q></blockquote>
+            <p class="muted">Saved <time>21:42</time> · Phone location attached · Trying again every 15 seconds</p>
+          </div>
+        </div>
+        <p class="hint">Keep GridLock open if you can. If you close it, it tries again the next time you open it.</p>
+      </div>
+      <div class="foot"><button class="send ghost">Try now</button></div>
+    </div>
+  </div>
+
+  <!-- ============ F: acknowledged ============ -->
+  <div>
+    <p class="frame-label"><b>F</b>Received — with its reference id</p>
+    <div class="phone">
+      <div class="bar"><div class="mark"><svg><use href="#hex"/></svg>GridLock</div></div>
+      <div class="sos"><span>In danger right now?</span><a href="#">Call SAPS<span>10111</span></a></div>
+      <div class="body">
+        <div class="panel">
+          <div class="ok-rule"></div>
+          <div class="in">
+            <h3>Report received</h3>
+            <p>Neighbourhood responders can see it now.</p>
+            <p class="muted">Received <time>21:42:07</time></p>
+            <div class="ref">
+              <span class="label">Reference</span>
+              <div class="id"><code>7b89d4e5-6f1a-4d2b-9e3c-8f1a2b3c4d5e</code><button>Copy</button></div>
+            </div>
+            <blockquote><q>Men breaking through my back gate, 14 Sisulu Street. We are inside.</q></blockquote>
+          </div>
+        </div>
+        <p class="hint">GridLock ranks reports for responders. It doesn't call the police for you.</p>
+      </div>
+      <div class="foot"><button class="send ghost">Send another report</button></div>
+    </div>
+  </div>
+
+  <!-- ============ G: rejected ============ -->
+  <div>
+    <p class="frame-label"><b>G</b>Not accepted — text kept</p>
+    <div class="phone">
+      <div class="bar"><div class="mark"><svg><use href="#hex"/></svg>GridLock</div></div>
+      <div class="sos"><span>In danger right now?</span><a href="#">Call SAPS<span>10111</span></a></div>
+      <div class="body">
+        <div class="panel">
+          <div class="err-rule"></div>
+          <div class="in">
+            <h3>Not sent</h3>
+            <p>GridLock couldn't accept this report as it is. Your text is kept below. Check it and send again.</p>
+          </div>
+        </div>
+        <div class="field">
+          <label>Describe it</label>
+          <div class="textarea">Men breaking through my back gate, 14 Sisulu Street. We are inside.</div>
+          <span class="count">68 / 2000</span>
+        </div>
+      </div>
+      <div class="foot"><button class="send">Send report</button></div>
+    </div>
+  </div>
+</div>
+
+</body>
+</html>
