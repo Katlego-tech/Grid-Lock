@@ -37,6 +37,10 @@
 
 set -u
 
+# git quotes any path holding a non-ASCII byte ("caf\303\251.py") unless told not to, and
+# a quoted path matches no file on disk -- it would drop out of every sweep silently.
+git() { command git -c core.quotePath=false "$@"; }
+
 root="$(git rev-parse --show-toplevel)"
 cd "$root"
 
@@ -54,7 +58,9 @@ while [ $# -gt 0 ]; do
   esac
 done
 
-fail=0
+fail=0             # the step in progress has failed; settle_step() moves it to failed_steps
+failed_steps=()    # what the final report names
+current_step="setup"
 ran=0
 manifests=0
 
@@ -68,13 +74,36 @@ declare -A UNTESTED=()
 # Tunables for the checks below. They live here, not in CI or the hook, like everything else.
 DUPLICATION_THRESHOLD=5   # max % of duplicated lines across the repo's source (jscpd)
 JSCPD_VERSION=5.2.0       # pinned: npx fetches exactly this version, never "latest"
+# php -l runs in this image when php isn't on PATH. Pinned by digest, and the PHP shared
+# hosts run (8.3): a syntax check by a different PHP can pass code the host won't parse.
+PHP_IMAGE="php:8.3-cli@sha256:f1ed6d1fd0aa769ab94ca307b9deaf55fbc18434315b70e319cd79078515cd2b"
 
 # Committed lockfiles of the projects found, scanned together by vuln_scan().
 LOCKFILES=()
 
 say()  { printf '%s\n' "$*"; }
-step() { printf '\n-> %s\n' "$*"; }
 bad()  { printf '!! %s\n' "$*"; }
+
+# Checks only ever set fail=1, and the step that was running gets the blame when the next one
+# starts. in_step names a check that prints no heading of its own; step prints one too.
+settle_step() {
+  [ "$fail" -ne 0 ] || return 0
+  failed_steps+=("$current_step")
+  fail=0
+}
+in_step() { settle_step; current_step="$*"; }
+step()    { in_step "$*"; printf '\n-> %s\n' "$*"; }
+
+# True if anything failed, after printing what did. The output above can run to thousands of
+# lines, so the last thing on screen is the list of what to go and look for.
+report_failures() {  # $1 is the name in the banner
+  settle_step
+  [ "${#failed_steps[@]}" -gt 0 ] || return 1
+  say ""
+  say "== $1 FAILED =="
+  printf '!! failed: %s\n' "${failed_steps[@]}"
+  return 0
+}
 
 # Directories that can hold a project of their own. Root first, then this repo's
 # services/apps/packages layout and infra/ (compose, broker topology and schema, whose
@@ -93,7 +122,9 @@ project_dirs() {
 # resort and never the assumption: on Debian/Ubuntu derivatives `python` does not
 # exist at all (only `python3`), which is exactly how the old gate silently skipped
 # every Python suite it was supposed to run.
-py_runner=""      # how to invoke a tool, e.g. "uv run --frozen" or "/path/.venv/bin/python -m"
+# An array, so a repo path holding a space ("~/projects/Jozi Buddy") stays one word when the
+# runner is invoked. As a string it split there, and every Python check failed to start.
+py_runner=()      # how to invoke a tool, e.g. (uv run --frozen) or ("/path/.venv/bin/python" -m)
 py_kind=""
 py_venv=""        # the virtualenv the runner belongs to, when it is one
 py_python=""      # that virtualenv's interpreter, when it is one
@@ -110,9 +141,9 @@ pyrun() {
   local d="$1"; shift
   if [ -n "$py_venv" ]; then
     ( cd "$d" && VIRTUAL_ENV="$py_venv" PATH="$(path_entry "$(venv_bin "$py_venv")"):$PATH" \
-        $py_runner "$@" )
+        "${py_runner[@]}" "$@" )
   else
-    ( cd "$d" && $py_runner "$@" )
+    ( cd "$d" && "${py_runner[@]}" "$@" )
   fi
 }
 
@@ -153,27 +184,27 @@ venv_python() {
 
 resolve_python() {
   local dir="$1"
-  py_runner=""; py_kind=""; py_venv=""; py_python=""
+  py_runner=(); py_kind=""; py_venv=""; py_python=""
 
   local py
   if py="$(venv_python "$dir/.venv")"; then
-    py_runner="$py -m"; py_kind="venv ($dir/.venv)"; py_venv="$dir/.venv"; py_python="$py"
+    py_runner=("$py" -m); py_kind="venv ($dir/.venv)"; py_venv="$dir/.venv"; py_python="$py"
     return 0
   fi
   if py="$(venv_python "$root/.venv")"; then
-    py_runner="$py -m"; py_kind="venv ($root/.venv)"; py_venv="$root/.venv"; py_python="$py"
+    py_runner=("$py" -m); py_kind="venv ($root/.venv)"; py_venv="$root/.venv"; py_python="$py"
     return 0
   fi
   # A workspace member is locked by the root's uv.lock, not one of its own.
   if { [ -f "$dir/uv.lock" ] || [ -f "$root/uv.lock" ]; } && command -v uv >/dev/null 2>&1; then
-    py_runner="uv run --frozen"; py_kind="uv (uv.lock)"; return 0
+    py_runner=(uv run --frozen); py_kind="uv (uv.lock)"; return 0
   fi
   if command -v uv >/dev/null 2>&1 && [ -f "$dir/pyproject.toml" ]; then
-    py_runner="uv run"; py_kind="uv"; return 0
+    py_runner=(uv run); py_kind="uv"; return 0
   fi
   for candidate in python3 python; do
     if command -v "$candidate" >/dev/null 2>&1 && "$candidate" -c "import pytest" >/dev/null 2>&1; then
-      py_runner="$candidate -m"; py_kind="$candidate on PATH"; return 0
+      py_runner=("$candidate" -m); py_kind="$candidate on PATH"; return 0
     fi
   done
   return 1
@@ -189,6 +220,7 @@ check_python() {
   manifests=$((manifests + 1))
 
   if ! resolve_python "$dir"; then
+    in_step "python environment ($rel)"
     bad "$rel has a Python project but no usable interpreter."
     bad "   Tried: $dir/.venv, $root/.venv, uv, python3+pytest, python+pytest."
     bad "   Fix the environment -- a gate that cannot run is not a gate that passed."
@@ -211,6 +243,7 @@ check_python() {
   else
     # The skip rule covers lint exactly as it covers tests. This used to print
     # "skipping lint" and carry on -- a skipped check reporting green.
+    in_step "ruff ($rel)"
     bad "$rel has no ruff in its environment, so its lint and format checks cannot run."
     bad "   Add it as a dev dependency:  uv add --dev ruff   (or list it in requirements.txt)"
     fail=1
@@ -229,6 +262,7 @@ check_python() {
     fi
     ran=$((ran + 1))
   else
+    in_step "pyright ($rel)"
     bad "$rel has no pyright in its environment, so its type check cannot run."
     bad "   Add it as a dev dependency:  uv add --dev pyright   (or list it in requirements.txt)"
     fail=1
@@ -237,13 +271,14 @@ check_python() {
   step "pytest ($rel)"
   pyrun "$dir" pytest -q
   rc=$?
-  ran=$((ran + 1))
   if [ "$rc" -eq 5 ]; then
-    # 5 == "no tests collected". Legitimate only while a package genuinely has no
-    # suite yet. It is reported loudly so it cannot quietly become permanent.
-    bad "   no tests collected in $rel -- if this package has behaviour, it needs tests."
-  elif [ "$rc" -ne 0 ]; then
+    # 5 == "no tests collected": nothing ran, so this is not a check that passed.
+    bad "   pytest collected no tests in $rel -- a check that did not run is a failed check."
+    bad "   If this package has behaviour, it needs tests."
     fail=1
+  else
+    ran=$((ran + 1))
+    [ "$rc" -eq 0 ] || fail=1
   fi
 }
 
@@ -273,6 +308,7 @@ check_node() {
   local dir="$1" rel="$2" pm
   [ -f "$dir/package.json" ] || return 0
   manifests=$((manifests + 1))
+  in_step "node environment ($rel)"
 
   pm="$(node_pm "$dir")"
   if ! command -v "$pm" >/dev/null 2>&1; then
@@ -317,6 +353,7 @@ check_node() {
     ( cd "$dir" && "$pm" run lint ) || fail=1
     ran=$((ran + 1))
   else
+    in_step "$pm run lint ($rel)"
     bad "$rel declares no 'lint' script, so its code ships unanalysed."
     bad "   Add one that runs its static checks, e.g."
     bad "   \"lint\": \"eslint . && prettier --check . && tsc --noEmit\""
@@ -337,6 +374,7 @@ check_node() {
     #     UNTESTED["apps/web"]="T031"
     # That keeps the gap loud on every single run and attached to a task somebody owns,
     # which is the opposite of silencing it with a fake "test" script.
+    in_step "$pm test ($rel)"
     local declared="${UNTESTED[$rel]:-}"
     if [ -n "$declared" ]; then
       bad "$rel has no test suite -- declared, tracked as $declared."
@@ -356,6 +394,118 @@ check_node() {
   fi
 }
 
+# ------------------------------------------------------------------- PHP ----
+# PHP is often not a package at all: a few endpoints beside a static site, deployed to a
+# shared host that parses them on the first request. So there are two checks. Every
+# tracked .php file goes through `php -l` -- a syntax error otherwise surfaces as a 500 in
+# production. And a directory with a composer.json is a package like any other: installed,
+# with a test script the gate runs, or declared UNTESTED against a task.
+php_files() {  # tracked PHP files that are the project's own (not vendored, not fixtures)
+  git ls-files -- '*.php' \
+    | grep -Ev '(^|/)(docs|legacy|fixtures|mocks|__mocks__|testdata|node_modules|vendor)/' || true
+}
+
+php_lint() {
+  local -a files
+  mapfile -t files < <(php_files)
+  [ "${#files[@]}" -gt 0 ] || return 0
+  step "php -l (${#files[@]} PHP file(s), $(command -v php >/dev/null 2>&1 && echo "php on PATH" || echo "$PHP_IMAGE"))"
+  local out rc=0
+  # One PHP process per file, in one shell, so a failure names its file. php -l exits 255 on
+  # a parse error; anything else non-zero means it didn't run, which fails just the same.
+  local lint='for f in "$@"; do php -d display_errors=stderr -l "$f" >/dev/null || { echo "!! $f"; s=1; }; done; exit ${s:-0}'
+  if command -v php >/dev/null 2>&1; then
+    out="$( cd "$root" && bash -c "$lint" lint "${files[@]}" 2>&1 )" || rc=$?
+  elif command -v docker >/dev/null 2>&1; then
+    out="$(docker run --rm --network none -v "$root:/src:ro" -w /src "$PHP_IMAGE" \
+             sh -c "$lint" lint "${files[@]}" 2>&1)" || rc=$?
+  else
+    bad "There are PHP files, but neither php nor docker is on PATH, so they can't be checked."
+    bad "   Install PHP (the version the host runs), or Docker for the $PHP_IMAGE image."
+    fail=1
+    return 0
+  fi
+  ran=$((ran + 1))
+  if [ "$rc" -ne 0 ]; then
+    printf '%s\n' "$out" | sed 's/^/   /'
+    bad "PHP with a syntax error never reaches the host: fix the file(s) above."
+    fail=1
+  else
+    say "   no syntax errors"
+  fi
+}
+
+composer_has_test() {  # does composer.json in $1 declare a test script?
+  ( cd "$1" && composer config scripts.test >/dev/null 2>&1 )
+}
+
+check_composer() {
+  local dir="$1" rel="$2"
+  [ -f "$dir/composer.json" ] || return 0
+  manifests=$((manifests + 1))
+  in_step "composer environment ($rel)"
+
+  if ! composer --version >/dev/null 2>&1; then
+    bad "$rel has a composer.json but Composer can't run (is it on PATH?) -- its suite cannot run."
+    fail=1
+    return 0
+  fi
+  if [ ! -d "$dir/vendor" ]; then
+    bad "$rel has a composer.json but no installed dependencies -- its suite cannot run."
+    bad "   Run 'composer install' in $rel."
+    fail=1
+    return 0
+  fi
+
+  local has_test=no
+  composer_has_test "$dir" && has_test=yes
+  if [ "$list_only" -eq 1 ]; then
+    if [ "$has_test" = yes ]; then say "   would run (composer): test ($rel)"
+    else say "   (no 'test' script in composer.json -- would FAIL)"
+    fi
+    return 0
+  fi
+
+  if [ "$has_test" = yes ]; then
+    step "composer test ($rel)"
+    ( cd "$dir" && composer test ) || fail=1
+    ran=$((ran + 1))
+  else
+    # The same rule as check_node(): no test script is untested code, unless the package
+    # is declared in UNTESTED against the task that will write its suite.
+    in_step "composer test ($rel)"
+    local declared="${UNTESTED[$rel]:-}"
+    if [ -n "$declared" ]; then
+      bad "$rel has no test suite -- declared, tracked as $declared."
+      bad "   Its behaviour is unproven. This exemption is not a pass; close $declared."
+    else
+      bad "$rel declares no 'test' script in composer.json, so its code ships unproven."
+      bad "   Write the suite (\"scripts\": {\"test\": \"phpunit\"}). If it genuinely cannot be"
+      bad "   written yet, the package is BLOCKED: add a task and declare it via UNTESTED[\"$rel\"]."
+      fail=1
+    fi
+  fi
+}
+
+# ------------------------------------------------------------ file lists ----
+# Paths travel through this script as newline-separated lists and are handed to grep and
+# jscpd as arrays -- never as one space-joined string. The sweeps used to build
+# `existing="$existing $root/$f"` and expand it unquoted, so a repo cloned into
+# "~/projects/88 redesign" handed grep the fragments ".../88" and "redesign/src/x.html",
+# grep could open neither, and both sweeps printed "clean" having read nothing.
+#
+# Read a newline-separated list of repo-relative paths on stdin; fill the array named
+# $1 with the absolute path of each one that exists. Blank lines are dropped.
+existing_files() {
+  local -n _out="$1"
+  local f
+  _out=()
+  while IFS= read -r f; do
+    [ -n "$f" ] && [ -f "$root/$f" ] && _out+=("$root/$f")
+  done
+  return 0
+}
+
 # ---------------------------------------------------------- placeholders ----
 # The central rule: nothing ships with a stub standing in for real work. This is the
 # check that enforces it mechanically rather than by review.
@@ -364,13 +514,16 @@ check_node() {
 # the index is empty, so a sweep written that way reads zero files and always passes.
 placeholder_sweep() {
   step "placeholder sweep"
-  local files existing=""
+  local files rc
+  local -a existing
 
   if [ -n "$changed_files_list" ] && [ -f "$changed_files_list" ]; then
     files="$(cat "$changed_files_list")"
   else
-    say "   no change list given -- sweeping the whole tracked tree"
-    files="$(git ls-files)"
+    # Untracked too: a freshly generated scaffold has nothing tracked yet, and a sweep of
+    # `git ls-files` alone would read nothing and call it clean.
+    say "   no change list given -- sweeping the whole tree, untracked files included"
+    files="$(git ls-files --cached --others --exclude-standard)"
   fi
 
   # Excluded: markdown and docs (prose about TODOs is not a TODO), fixtures and
@@ -381,25 +534,33 @@ placeholder_sweep() {
             | grep -Ev '(^|/)(fixtures|mocks|__mocks__|testdata)/' \
             | grep -Ev '\.(md|txt|lock|svg|png|jpg|jpeg|gif|webp|ico)$' || true)"
 
-  for f in $files; do
-    [ -f "$root/$f" ] && existing="$existing $root/$f"
-  done
-  [ -n "$existing" ] || { say "   nothing to sweep"; return 0; }
+  existing_files existing <<< "$files"
+  # The sweep ran either way. Not counting it made a docs-only push report one check fewer
+  # than a full run, which reads as a check having gone missing.
+  ran=$((ran + 1))
+  [ "${#existing[@]}" -gt 0 ] || { say "   nothing to sweep"; return 0; }
 
   # `XXX` is deliberately NOT in this list. It collides with real data far too often --
   # ISO 4217's "no currency" code, redacted digits, placeholder hostnames -- and a sweep
   # that cries wolf gets disabled, which costs more than the few stubs it would catch.
-  # shellcheck disable=SC2086
-  if grep -nE '\b(TODO|FIXME|HACK|NotImplementedError|not implemented)\b' $existing; then
+  #
+  # grep exits 0 on a match, 1 on none, and 2 when it could not read a file. Only 1 is
+  # clean: treating 2 as "no match" is how this sweep passed without reading anything.
+  grep -InE '\b(TODO|FIXME|HACK|NotImplementedError|not implemented)\b' -- "${existing[@]}"
+  rc=$?
+  if [ "$rc" -eq 0 ]; then
     bad "Placeholders found in the code being pushed."
     bad "   Work closed on a stub is BLOCKED, not done."
     bad "   If a stub is genuinely intended, name its tracking issue beside it"
     bad "   and it stops being a placeholder -- but say so, do not hide it."
     fail=1
+  elif [ "$rc" -ne 1 ]; then
+    bad "The placeholder sweep could not read the files above (grep exit $rc)."
+    bad "   A sweep that did not read the code is a failed sweep, not a clean one."
+    fail=1
   else
     say "   clean"
   fi
-  ran=$((ran + 1))
 }
 
 # --------------------------------------------------------------- secrets ----
@@ -412,12 +573,13 @@ placeholder_sweep() {
 # that actually leak in practice: a committed .env, a pasted key, a hardcoded password.
 secret_sweep() {
   step "secret sweep"
-  local files existing="" hits=0
+  local files hits=0 rc found keylist
+  local -a existing keyfiles
 
   if [ -n "$changed_files_list" ] && [ -f "$changed_files_list" ]; then
     files="$(cat "$changed_files_list")"
   else
-    files="$(git ls-files)"
+    files="$(git ls-files --cached --others --exclude-standard)"
   fi
 
   # Committed env files are the single most common leak, and no content check is
@@ -431,34 +593,73 @@ secret_sweep() {
     hits=1
   fi
 
+  # Key shapes are read almost everywhere, prose included: workflows and docs are where a
+  # token gets pasted. The looser literal scan below stays out of them, because prose and
+  # YAML legitimately say things like password: "...".
+  keylist="$(printf '%s\n' "$files" \
+            | grep -Ev '^(legacy/|\.githooks/|scripts/gate\.sh$)' \
+            | grep -Ev '(^|/)__pycache__/' \
+            | grep -Ev '\.(lock|svg|png|jpg|jpeg|gif|webp|ico)$' || true)"
+  existing_files keyfiles <<< "$keylist"
+
   files="$(printf '%s\n' "$files" \
             | grep -Ev '^(docs/|legacy/|\.githooks/|\.github/|scripts/gate\.sh$)' \
-            | grep -Ev '\.(md|lock|svg|png|jpg|jpeg|gif|webp|ico)$' || true)"
-  for f in $files; do
-    [ -f "$root/$f" ] && existing="$existing $root/$f"
-  done
+            | grep -Ev '(^|/)__pycache__/' \
+            | grep -Ev '\.(md|lock|svg|png|jpg|jpeg|gif|webp|ico)$' \
+            | grep -Ev '(^|/)(tests?|__tests__|fixtures|mocks|__mocks__|testdata|examples?|samples?)/' \
+            | grep -Ev '(\.(test|spec)\.[a-z]+|(^|/)test_[^/]*\.py|_test\.(py|go))$' || true)"
+  existing_files existing <<< "$files"
 
-  if [ -n "$existing" ]; then
-    # Well-known key shapes, plus assignment of a secret-ish name to a literal that
-    # isn't obviously a placeholder or an env lookup.
-    # shellcheck disable=SC2086
-    if grep -nE \
+  if [ "${#keyfiles[@]}" -gt 0 ]; then
+    # Well-known key shapes. grep exit 2 means it could not read a file -- that fails the
+    # sweep instead of passing it, as in the placeholder sweep. -I skips binaries, whose
+    # "binary file matches" names no line anyone can act on.
+    found="$(grep -InHE \
         -e '(AKIA|ASIA)[0-9A-Z]{16}' \
         -e 'sk-[A-Za-z0-9_-]{20,}' \
         -e 'ghp_[A-Za-z0-9]{36}' \
         -e 'xox[baprs]-[A-Za-z0-9-]{10,}' \
         -e '-----BEGIN [A-Z ]*PRIVATE KEY-----' \
-        $existing 2>/dev/null; then
+        -- "${keyfiles[@]}")"
+    rc=$?
+    if [ "$rc" -eq 0 ]; then
+      found="${found//"$root/"/}"
+      printf '%s\n' "$found"
       bad "   the above matches the shape of a real credential (AWS / OpenAI / GitHub /"
       bad "   Slack token, or a private key). Rotate it -- assume it is already burned."
+      name_hits "$found"
+      hits=1
+    elif [ "$rc" -ne 1 ]; then
+      bad "   the credential scan could not read the files above (grep exit $rc)."
       hits=1
     fi
-    # shellcheck disable=SC2086
-    if grep -nEi '(api[_-]?key|secret|password|passwd|token|credential)[[:space:]]*[:=][[:space:]]*["'"'"'][^"'"'"']{12,}["'"'"']' \
-        $existing 2>/dev/null \
-        | grep -Eiv '(example|placeholder|changeme|your[_-]?|xxx|\*{4,}|dummy|fake|test|sample|<|\$\{|process\.env|os\.environ|getenv)'; then
+  fi
+
+  if [ "${#existing[@]}" -gt 0 ]; then
+    # Assignment of a secret-ish name to a literal that isn't obviously a placeholder or an
+    # env lookup. That filter reads only the matched text: run over the file's path too, it
+    # dropped every hit in a clone under a folder called "test", and in src/latest.py.
+    found="$(grep -InHEi '(api[_-]?key|secret|password|passwd|token|credential)[[:space:]]*[:=][[:space:]]*["'"'"'][^"'"'"']{12,}["'"'"']' \
+        -- "${existing[@]}")"
+    rc=$?
+    if [ "$rc" -gt 1 ]; then
+      bad "   the secret-literal scan could not read the files above (grep exit $rc)."
+      hits=1
+    fi
+    found="${found//"$root/"/}"
+    local benign='(example|placeholder|changeme|your[_-]?|xxx|\*{4,}|dummy|fake|test|sample|<|\$\{|process\.env|os\.environ|getenv)'
+    local line text kept=""
+    while IFS= read -r line; do
+      [ -n "$line" ] || continue
+      text="${line#*:[0-9]*:}"
+      [[ "${text,,}" =~ $benign ]] || kept+="$line"$'\n'
+    done <<< "$found"
+    found="${kept%$'\n'}"
+    if [ -n "$found" ]; then
+      printf '%s\n' "$found"
       bad "   a secret-looking literal is assigned in the code above."
       bad "   Read it from the environment instead, and rotate it if it is real."
+      name_hits "$found"
       hits=1
     fi
   fi
@@ -473,24 +674,47 @@ secret_sweep() {
   ran=$((ran + 1))
 }
 
+# Name the files behind grep -H output ("path:line:text") in the !! block.
+name_hits() {
+  local f
+  while IFS= read -r f; do
+    bad "   in: $f"
+  done < <(printf '%s\n' "$1" | sed -E 's/:[0-9]+:.*$//' | sort -u)
+}
+
 # ------------------------------------------------------------- lockfiles ----
-# Echo the committed lockfile pinning $1's dependencies of kind $2 (py | node): the
+# Echo the committed lockfile pinning $1's dependencies of kind $2 (py | node | php): the
 # directory's own, else the workspace root's. Committed only -- CI's install step
 # generates a lockfile when none exists, and a generated one pins nothing anyone
 # reviewed. requirements.txt counts only in the project's own directory, and only
-# its == pins are exact enough to scan.
+# when requirements_pinned() says every line is an == pin, the only form exact enough to scan.
+requirements_pinned() {
+  # Comments, blank lines and option lines (-r, -e, --hash continuations) pin nothing and
+  # loosen nothing. Whatever is left must read name==version, with an optional env marker.
+  # A file with nothing left, only -r or -e lines say, pins nothing and is no lockfile.
+  local reqs
+  reqs="$(sed -e 's/[[:space:]]*#.*$//' -e 's/^[[:space:]]*//' -e 's/[[:space:]]*\\$//' "$1" \
+    | grep -v '^$' | grep -v '^-')"
+  [ -n "$reqs" ] || return 1
+  ! printf '%s\n' "$reqs" \
+    | grep -Evq '^[A-Za-z0-9._-]+(\[[^]]*\])?[[:space:]]*==[[:space:]]*[^*,;[:space:]]+[[:space:]]*(--[^[:space:]]+[[:space:]]*)*(;.*)?$'
+}
+
 committed_lockfile() {
   local dir="$1" kind="$2" d f names path
   for d in "$dir" "$root"; do
     if [ "$kind" = py ]; then
       names="uv.lock poetry.lock pdm.lock Pipfile.lock"
       [ "$d" = "$dir" ] && names="$names requirements.txt"
+    elif [ "$kind" = php ]; then
+      names="composer.lock"
     else
       names="pnpm-lock.yaml yarn.lock bun.lock package-lock.json npm-shrinkwrap.json"
     fi
     for f in $names; do
       path="${d#"$root"}"; path="${path#/}"; path="${path:+$path/}$f"
       if git ls-files --error-unmatch -- "$path" >/dev/null 2>&1; then
+        [ "$f" = requirements.txt ] && ! requirements_pinned "$root/$path" && continue
         printf '%s\n' "$path"; return 0
       fi
     done
@@ -503,20 +727,24 @@ committed_lockfile() {
 # missing lockfile fails here rather than letting the scan quietly cover less.
 collect_lockfiles() {
   local dir="$1" rel="$2" kind lock
-  for kind in py node; do
+  for kind in py node php; do
     if [ "$kind" = py ]; then
       is_python_project "$dir" || continue
       # A uv workspace root's uv.lock is collected through its members. Only its Python
       # side is skipped: the same root can be an npm workspace whose lockfile is its own.
       is_workspace_root "$dir" && continue
+    elif [ "$kind" = php ]; then [ -f "$dir/composer.json" ] || continue
     else [ -f "$dir/package.json" ] || continue
     fi
     if lock="$(committed_lockfile "$dir" "$kind")"; then
       case " ${LOCKFILES[*]:-} " in *" $lock "*) ;; *) LOCKFILES+=("$lock") ;; esac
     else
+      in_step "lockfile ($rel)"
       bad "$rel has no committed lockfile, so its dependencies cannot be scanned for known vulnerabilities."
       if [ "$kind" = py ]; then
         bad "   Create one with  uv lock  (or pin every line of requirements.txt with ==), and commit it."
+      elif [ "$kind" = php ]; then
+        bad "   Run 'composer install' and commit the composer.lock it writes."
       else
         bad "   Run '$(node_pm "$dir") install' and commit the lockfile it writes."
       fi
@@ -572,6 +800,10 @@ vuln_scan() {
     done < <(osv_exemptions "$config")
   fi
 
+  # Everything scanned here is already a full lock, so osv-scanner must not re-resolve it.
+  # Without this it resolves a pinned requirements.txt through deps.dev, and one version
+  # deps.dev doesn't know yet aborts the extraction: 0 packages scanned, exit 127.
+  args+=(--no-resolve)
   for lock in "${LOCKFILES[@]}"; do args+=(-L "$root/$lock"); done
   say "   lockfiles: ${LOCKFILES[*]}"
 
@@ -583,7 +815,7 @@ vuln_scan() {
     bad "   or, only if none exists yet, declare it in osv-scanner.toml against a tracked follow-up."
     fail=1
   elif [ "$rc" -ne 0 ]; then
-    bad "osv-scanner could not complete (exit $rc) -- usually no network. A scan that did not"
+    bad "osv-scanner could not complete (exit $rc): see its output above. A scan that did not"
     bad "   run is a failed scan, not a clean one."
     fail=1
   fi
@@ -603,14 +835,15 @@ vuln_scan() {
 #     # jscpd:ignore-end
 duplication_check() {
   step "duplication check (jscpd $JSCPD_VERSION, threshold $DUPLICATION_THRESHOLD%)"
-  local files out rc
+  local out rc
+  local -a files
 
-  files="$(git ls-files \
+  mapfile -t files < <(git ls-files \
             | grep -E '\.(py|ts|tsx|js|jsx|mjs|cjs|go|rs|java|rb|php|c|cc|cpp|h|hpp|cs|kt|swift)$' \
             | grep -Ev '(^|/)(docs|legacy|fixtures|mocks|__mocks__|testdata|node_modules|vendor|dist|build|tests?|__tests__)/' \
             | grep -Ev '(^|/)components/ui/' \
-            | grep -Ev '(\.(test|spec)\.[a-z]+|(^|/)test_[^/]*\.py|_test\.(py|go))$' || true)"
-  if [ -z "$files" ]; then
+            | grep -Ev '(\.(test|spec)\.[a-z]+|(^|/)test_[^/]*\.py|_test\.(py|go))$' || true)
+  if [ "${#files[@]}" -eq 0 ]; then
     say "   no source files to compare"
     ran=$((ran + 1))
     return 0
@@ -623,9 +856,8 @@ duplication_check() {
   fi
 
   out="$(mktemp)"
-  # shellcheck disable=SC2086
   ( cd "$root" && npx --yes "jscpd@$JSCPD_VERSION" --threshold "$DUPLICATION_THRESHOLD" \
-      --reporters console --no-colors $files ) 2>&1 | tee "$out"
+      --reporters console --no-colors "${files[@]}" ) 2>&1 | tee "$out"
   rc=${PIPESTATUS[0]}
   ran=$((ran + 1))
   if [ "$rc" -ne 0 ]; then
@@ -672,7 +904,11 @@ install_deps() {
     elif [ -f "$dir/pyproject.toml" ]; then
       ( cd "$dir" && { uv sync --frozen || uv sync; } ) || fail=1
     elif [ -f "$dir/requirements.txt" ]; then
-      ( cd "$dir" && { [ -d .venv ] || uv venv .venv; } && uv pip install -r requirements.txt ) || fail=1
+      # The Python check demands ruff, pyright and pytest, which a project with a separate
+      # dev file keeps there.
+      local -a reqs=(-r requirements.txt)
+      [ -f "$dir/requirements-dev.txt" ] && reqs+=(-r requirements-dev.txt)
+      ( cd "$dir" && { [ -d .venv ] || uv venv .venv; } && uv pip install "${reqs[@]}" ) || fail=1
     else
       ( cd "$dir" && { [ -d .venv ] || uv venv .venv; } && uv pip install -e . ) || fail=1
     fi
@@ -691,6 +927,17 @@ install_deps() {
       ( cd "$dir" && "$pm" install ) || fail=1
     fi
   fi
+
+  if [ -f "$dir/composer.json" ]; then
+    manifests=$((manifests + 1))
+    step "composer install ($rel)"
+    if ! composer --version >/dev/null 2>&1; then
+      bad "   $rel has a composer.json but Composer can't run (is it on PATH?)."
+      fail=1
+    else
+      ( cd "$dir" && composer install --no-interaction ) || fail=1
+    fi
+  fi
 }
 
 # ------------------------------------------------------------------ run -----
@@ -704,13 +951,14 @@ while IFS= read -r dir; do
   else
     check_python      "$dir" "$rel"
     check_node        "$dir" "$rel"
+    check_composer    "$dir" "$rel"
     collect_lockfiles "$dir" "$rel"
   fi
 done < <(project_dirs)
 
 if [ "$install_only" -eq 1 ]; then
+  report_failures "dependency install" && exit 1
   say ""
-  if [ "$fail" -ne 0 ]; then say "== dependency install FAILED =="; exit 1; fi
   say "== dependencies installed for $manifests project manifest(s) =="
   exit 0
 fi
@@ -720,6 +968,8 @@ fi
 if [ "$list_only" -eq 1 ]; then
   say ""
   say "-> would run: placeholder sweep, secret sweep"
+  php_count="$(php_files | grep -c . || true)"
+  [ "$php_count" -gt 0 ] && say "-> would run: php -l on $php_count PHP file(s)"
   if [ "$manifests" -gt 0 ]; then
     say "-> would run: dependency vulnerability scan over: ${LOCKFILES[*]:-(no committed lockfiles)}"
     command -v osv-scanner >/dev/null 2>&1 || say "   (osv-scanner not on PATH -- would FAIL)"
@@ -733,6 +983,7 @@ fi
 
 placeholder_sweep
 secret_sweep
+php_lint
 
 # Both look at the whole repo rather than one project, so they run once, and only once
 # there is a project to look at.
@@ -753,7 +1004,7 @@ if [ "$manifests" -eq 0 ]; then
   fi
   if [ -n "$code" ]; then
     bad "Source files are being pushed, but this repo has no project manifest"
-    bad "   (no pyproject.toml / requirements.txt / package.json anywhere the gate looks)."
+    bad "   (no pyproject.toml / requirements.txt / package.json / composer.json anywhere the gate looks)."
     bad "   The gate cannot check this code, so it will not pretend to have checked it."
     bad "   Add the manifest, or add this directory to project_dirs() in scripts/gate.sh."
     printf '%s\n' "$code" | sed 's/^/     /'
@@ -768,12 +1019,10 @@ elif [ "$ran" -eq 0 ]; then
   exit 1
 fi
 
-if [ "$fail" -ne 0 ]; then
-  say ""
-  say "== gate FAILED =="
-  exit 1
-fi
+report_failures "gate" && exit 1
 
 say ""
 say "== gate passed ($ran check(s) run across $manifests project(s)) =="
 exit 0
+
+# kit: Cultivation 274af9562ecb4e86b8ba6a2998c105571eed0faf

@@ -11,6 +11,7 @@
 set -u
 
 root="$(git rev-parse --show-toplevel)"
+remote="${1:-origin}"   # git passes the remote's name as $1
 zero="0000000000000000000000000000000000000000"
 
 # git feeds the ref list on stdin, and reading it consumes it. Capture it once so the
@@ -19,6 +20,8 @@ refs="$(cat)"
 
 changed="$(mktemp)"
 trap 'rm -f "$changed"' EXIT
+
+carries_code=0
 
 while read -r local_ref local_sha remote_ref remote_sha; do
   [ -n "${local_ref:-}" ] || continue
@@ -33,29 +36,42 @@ while read -r local_ref local_sha remote_ref remote_sha; do
       ;;
   esac
 
-  # A branch deletion has nothing to check.
+  # A branch deletion or a tag puts no new code on a branch, so there is nothing to gate.
   [ "$local_sha" = "$zero" ] && continue
+  case "$remote_ref" in
+    refs/heads/*) carries_code=1 ;;
+    *) continue ;;
+  esac
 
-  if [ "$remote_sha" = "$zero" ]; then
-    # New branch: no remote side to diff against. Prefer the fork point from the
-    # default branch; if there isn't one (first push of a fresh repo), treat every
-    # tracked file at the tip as new, which for a first push it is.
-    base=""
-    for candidate in refs/heads/main refs/heads/master origin/main origin/master; do
+  # What to diff against: the remote tip when this clone has that commit. A new branch has
+  # none, and neither does a push over a tip never fetched here (a force-push). Then use
+  # the fork point from the default branch, the remote's copy first: what matters is what
+  # the remote hasn't got, and against local main alone, a branch at local main's tip
+  # would diff to nothing. Failing that, sweep every tracked file at the tip, as for a
+  # first push. A diff that fails does the same, so the sweeps never read an empty list
+  # by accident.
+  base=""
+  if [ "$remote_sha" != "$zero" ] && git cat-file -e "$remote_sha^{commit}" 2>/dev/null; then
+    base="$remote_sha"
+  else
+    for candidate in "refs/remotes/$remote/main" "refs/remotes/$remote/master" \
+                     refs/heads/main refs/heads/master; do
       if base="$(git merge-base "$local_sha" "$candidate" 2>/dev/null)"; then break; fi
       base=""
     done
-    if [ -n "$base" ]; then
-      git diff --name-only --diff-filter=ACM "$base..$local_sha" >> "$changed" 2>/dev/null
-    else
-      git ls-tree -r --name-only "$local_sha" >> "$changed" 2>/dev/null
-    fi
-  else
-    git diff --name-only --diff-filter=ACM "$remote_sha..$local_sha" >> "$changed" 2>/dev/null
+  fi
+  if [ -z "$base" ] \
+     || ! git -c core.quotePath=false diff --name-only --diff-filter=ACMR "$base..$local_sha" >> "$changed"; then
+    git -c core.quotePath=false ls-tree -r --name-only "$local_sha" >> "$changed" || {
+      echo "!! could not list the files of $local_sha -- the sweeps would read nothing."
+      exit 1
+    }
   fi
 done <<EOF
 $refs
 EOF
+
+[ "$carries_code" -eq 1 ] || exit 0
 
 sort -u -o "$changed" "$changed"
 
