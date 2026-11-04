@@ -1,0 +1,5 @@
+# Accepted advisories, each against what closes it. The gate prints these on every run.
+[[IgnoredVulns]]
+id = "GHSA-g3hv-75wg-m249"
+ignoreUntil = 2027-02-04T00:00:00Z
+reason = "#69: minimatch 10.x, dev-only through eslint; the fix is only in 11.x"
