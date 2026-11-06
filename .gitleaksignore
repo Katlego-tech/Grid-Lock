@@ -1,0 +1,6 @@
+# False positives, checked 2026-11-06: the rabbitmq-init command in docker-compose.yml passes
+# the broker user and password as Compose variables, not values (rule curl-auth-user).
+824423dac05c70f5ab2d78c714ee041d762f8be7:docker-compose.yml:curl-auth-user:77
+6b020bcebca5262e8cb09edbae23daf090f7a9be:docker-compose.yml:curl-auth-user:77
+2be6adcacb3636c0562543455061a47c63e3d6ae:docker-compose.yml:curl-auth-user:73
+8d2255e4735013fddbc92c6ae160ca6a6c8b8e4c:docker-compose.yml:curl-auth-user:73

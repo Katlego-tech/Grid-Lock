@@ -12,6 +12,7 @@ set -u
 
 root="$(git rev-parse --show-toplevel)"
 remote="${1:-origin}"   # git passes the remote's name as $1
+remote_url="${2:-$remote}"
 zero="0000000000000000000000000000000000000000"
 
 # git feeds the ref list on stdin, and reading it consumes it. Capture it once so the
@@ -19,20 +20,55 @@ zero="0000000000000000000000000000000000000000"
 refs="$(cat)"
 
 changed="$(mktemp)"
-trap 'rm -f "$changed"' EXIT
+ranges="$(mktemp)"   # "<base> <tip>" per pushed branch; base is "-" when every commit is new
+trap 'rm -f "$changed" "$ranges"' EXIT
 
 carries_code=0
+
+# add_names <git arguments>: append the file names that git command prints to the change list,
+# one per line. False if the command failed.
+#
+# Read with -z, because git otherwise prints a name holding a double quote, a backslash or a tab
+# quoted ("q\"uote.py"), and a quoted name matches no file: the sweeps would skip it and pass. A
+# name holding a line break cannot travel in a list of lines at all, so it stops the push here.
+add_names() {
+  local raw
+  raw="$(mktemp)"
+  if ! git "$@" > "$raw"; then rm -f "$raw"; return 1; fi
+  if [ "$(LC_ALL=C tr -cd '\0' < "$raw" | wc -c)" -ne "$(LC_ALL=C tr '\0' '\n' < "$raw" | wc -l)" ]; then
+    rm -f "$raw"
+    echo "!! a file name being pushed holds a line break, so the sweeps cannot list it."
+    echo "   Rename the file. A file the sweeps cannot read is a file nobody checked."
+    exit 1
+  fi
+  LC_ALL=C tr '\0' '\n' < "$raw" >> "$changed"
+  rm -f "$raw"
+}
 
 while read -r local_ref local_sha remote_ref remote_sha; do
   [ -n "${local_ref:-}" ] || continue
 
   # Branch policy. `master` is covered as well as `main` -- a repo that uses the older
   # default should not be silently unprotected.
+  #
+  # The one push let through is the one that seeds a new repo: the remote has neither a main
+  # nor a master, so there is nothing to open a pull request against. It still goes through
+  # the gate below. "Neither" is asked of the remote itself: that this one ref is new there is
+  # not enough, or pushing HEAD:main at a repo whose branch is master would create a second,
+  # unreviewed default. Deleting main is refused like any other push to it.
+  seeding=0
   case "$remote_ref" in
     refs/heads/main|refs/heads/master)
-      echo "Direct pushes to '${remote_ref#refs/heads/}' are not allowed."
-      echo "Push a feature branch and open a PR:  git push -u origin feat/<name>"
-      exit 1
+      if [ "$remote_sha" = "$zero" ] && [ "$local_sha" != "$zero" ] \
+         && heads="$(git ls-remote --heads "$remote_url" 2>/dev/null)" \
+         && ! printf '%s\n' "$heads" | awk '$2 == "refs/heads/main" || $2 == "refs/heads/master" { f = 1 } END { exit !f }'; then
+        echo "Seeding '${remote_ref#refs/heads/}': the remote has no main or master yet, so this one push is allowed."
+        seeding=1
+      else
+        echo "Direct pushes to '${remote_ref#refs/heads/}' are not allowed."
+        echo "Push a feature branch and open a PR:  git push -u origin feat/<lane>"
+        exit 1
+      fi
       ;;
   esac
 
@@ -40,6 +76,19 @@ while read -r local_ref local_sha remote_ref remote_sha; do
   [ "$local_sha" = "$zero" ] && continue
   case "$remote_ref" in
     refs/heads/*) carries_code=1 ;;
+    refs/tags/*)
+      # Nothing to gate, but a tag publishes its commits, so the offline check below reads
+      # them too: from where they leave the default branch, as for a new branch.
+      if tip="$(git rev-parse -q --verify "$local_sha^{commit}" 2>/dev/null)"; then
+        tbase=""
+        for candidate in "refs/remotes/$remote/main" "refs/remotes/$remote/master" \
+                         refs/heads/main refs/heads/master; do
+          if tbase="$(git merge-base "$tip" "$candidate" 2>/dev/null)"; then break; fi
+          tbase=""
+        done
+        printf '%s %s\n' "${tbase:--}" "$tip" >> "$ranges"
+      fi
+      continue ;;
     *) continue ;;
   esac
 
@@ -60,9 +109,13 @@ while read -r local_ref local_sha remote_ref remote_sha; do
       base=""
     done
   fi
+  # A seed push has no fork point: measured from local main it would be main itself, the diff
+  # would be empty, and the whole scaffold would go out unswept. Every file at the tip is new.
+  [ "$seeding" -eq 1 ] && base=""
+  printf '%s %s\n' "${base:--}" "$local_sha" >> "$ranges"
   if [ -z "$base" ] \
-     || ! git -c core.quotePath=false diff --name-only --diff-filter=ACMR "$base..$local_sha" >> "$changed"; then
-    git -c core.quotePath=false ls-tree -r --name-only "$local_sha" >> "$changed" || {
+     || ! add_names diff -z --name-only --diff-filter=ACMR "$base..$local_sha"; then
+    add_names ls-tree -r -z --name-only "$local_sha" || {
       echo "!! could not list the files of $local_sha -- the sweeps would read nothing."
       exit 1
     }
@@ -71,14 +124,87 @@ done <<EOF
 $refs
 EOF
 
-[ "$carries_code" -eq 1 ] || exit 0
+# Only deletions: nothing leaves this machine. A tag alone still goes through the offline
+# check below, and stops before the gate.
+[ "$carries_code" -eq 1 ] || [ -s "$ranges" ] || exit 0
 
 sort -u -o "$changed" "$changed"
 
-if [ ! -x "$root/scripts/gate.sh" ]; then
+# A project that keeps the kit out of git has kit-refs.sh beside this hook. Its pre-commit
+# guard never runs for a rebase or a cherry-pick, and a merge can bring a kit file in from a
+# branch made elsewhere, so what is about to leave this machine is checked once more here.
+refs_file="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)/kit-refs.sh"
+if [ -f "$refs_file" ]; then
+  # shellcheck source=/dev/null
+  . "$refs_file"
+  if ! kit_ref_ready; then
+    echo "!! the KIT_REF pattern in kit-refs.sh is empty or not a pattern grep reads -- nothing can be checked."
+    exit 1
+  fi
+  # What the pushed commits carry, read from the commits themselves: the working tree may
+  # hold something else, and a line added in one commit and removed in the next is still in
+  # the history being published. Only what they add is read, so an old mention already on the
+  # remote doesn't block every later push that touches the file.
+  # pushed_log <git log arguments>: the log of every pushed range.
+  pushed_log() {
+    local b t
+    while read -r b t; do
+      [ -n "$t" ] || continue
+      if [ "$b" != - ]; then git log --diff-merges=first-parent "$@" "$b..$t"
+      else git log --diff-merges=first-parent "$@" "$t"; fi || return 1
+    done < "$ranges"
+  }
+  if ! paths="$(set -o pipefail; pushed_log --format= --name-only -z --diff-filter=ACMRT --no-renames | kit_local_paths)"; then
+    echo "!! could not list the files in the commits being pushed to check them."; exit 1
+  fi
+  if [ -n "$paths" ]; then
+    echo "!! these files are local to this machine and are in the commits being pushed:"
+    printf '%s\n' "$paths" | sort -u | sed 's/^/     /'
+    echo "   Take them out of the history before pushing (git rm --cached, then amend or rebase)."
+    exit 1
+  fi
+  if ! added="$(pushed_log --format= -p -U0 --no-color --no-ext-diff --text --no-renames)"; then
+    echo "!! could not read the commits being pushed to check them for kit references."; exit 1
+  fi
+  # A file's header runs from "diff --git" to its first "@@"; only after that is a line
+  # starting with "+" an added line, even one that reads "+++ ".
+  named="$(printf '%s\n' "$added" | awk '
+      /^diff --git / { hdr = 1; next }
+      hdr && /^\+\+\+ / { f = substr($0, 5); sub(/^b\//, "", f); next }
+      hdr && /^@@/ { hdr = 0; next }
+      !hdr && /^\+/ { print "     " f ": " substr($0, 2) }' | grep -E -- "$KIT_REF")"
+  if ! messages="$(pushed_log --format='%h %s%n%b')"; then
+    echo "!! could not read the messages being pushed to check them."; exit 1
+  fi
+  named+="$(printf '%s\n' "$messages" | grep -E -- "$KIT_REF" | sed 's/^/     message: /')"
+  if [ -n "$named" ]; then
+    echo "!! the commits being pushed name a local-only kit file or a task ID:"
+    printf '%s\n' "$named" | sort -u
+    echo "   Nobody else can open what those point at. Say it without the name or the ID."
+    exit 1
+  fi
+fi
+
+[ "$carries_code" -eq 1 ] || exit 0
+
+# A project that keeps the kit's files out of git has none of them in a linked worktree: git
+# checks out only what is tracked. install-hooks.sh points core.hooksPath at this checkout's
+# hooks for exactly that case, so this hook still runs there, and the gate beside it is the
+# project's own. It runs on the worktree being pushed from, and says where it came from.
+gate="$root/scripts/gate.sh"
+if [ ! -e "$gate" ]; then
+  beside="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." 2>/dev/null && pwd)/scripts/gate.sh"
+  if [ -x "$beside" ] && [ "$beside" != "$gate" ]; then
+    echo "!! this worktree has no scripts/gate.sh of its own (the kit's files are not in git)."
+    echo "   Running the gate from $beside"
+    gate="$beside"
+  fi
+fi
+
+if [ ! -x "$gate" ]; then
   echo "!! scripts/gate.sh is missing or not executable -- the gate cannot run."
   echo "   This hook does not pass on its own. Restore it:  chmod +x scripts/gate.sh"
   exit 1
 fi
 
-exec bash "$root/scripts/gate.sh" --changed-files "$changed"
+exec bash "$gate" --changed-files "$changed"

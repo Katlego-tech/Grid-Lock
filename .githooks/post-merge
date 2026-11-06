@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+# Post-merge: after `git pull` on main, delete the local branches that have landed.
+# Enable once per clone:  bash install-hooks.sh
+#
+# This is step 8 of the loop in docs/git-workflow.md ("git switch main && git pull"),
+# so the cleanup happens exactly when a contributor picks up merged work. Every rule
+# about what counts as merged lives in scripts/prune-branches.sh.
+#
+# A post-merge hook cannot undo the pull, and this one never fails it: pruning is
+# housekeeping, and a network hiccup must not look like a broken merge.
+
+root="$(git rev-parse --show-toplevel)"
+
+case "$(git symbolic-ref --short -q HEAD)" in
+  main|master) ;;
+  *) exit 0 ;;
+esac
+
+[ -f "$root/scripts/prune-branches.sh" ] || exit 0
+bash "$root/scripts/prune-branches.sh" || true
+exit 0
