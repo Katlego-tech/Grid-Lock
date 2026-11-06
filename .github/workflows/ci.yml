@@ -14,15 +14,28 @@
 
 name: CI
 
+# Pushes run on main only; a branch gets the gate through its PR. Running on pushes to
+# every branch as well ran it twice for each commit on a branch with an open PR -- one run
+# for the push, one for the PR, in different concurrency groups, so neither cancelled the other.
+#
+# `edited` is in the list because retargeting a stacked PR onto main is an edit, and GitHub starts
+# nothing for it otherwise. A title or description edit reruns the gate too, which costs minutes
+# but can't let anything through.
 on:
   push:
-    branches: ["**"]        # every branch (tags don't run the gate)
+    branches: [main]
   pull_request:
     branches: [main]
+    types: [opened, synchronize, reopened, edited]
 
+permissions:
+  contents: read
+
+# A new push to a branch replaces the run it makes stale. Never on main: there, the second of two
+# quick merges would cancel the first merge's check.
 concurrency:
   group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 jobs:
   gate:
@@ -35,11 +48,61 @@ jobs:
           # The placeholder sweep needs the commits being introduced, not just the tip.
           fetch-depth: 0
 
+      # --- what changed -----------------------------------------------------
+      # Done first, because a change that touches nothing but the status board and the AI entry
+      # points has nothing to check, and every step below is skipped for it. This is deliberately
+      # not `paths-ignore`: a workflow ignored that way reports no status at all, so a required
+      # `gate` check would wait forever and that PR could never merge. Skipped steps still report
+      # a green `gate`.
+      #
+      # The diff is from the merge-base, as in the pre-push hook, so CI and the hook sweep the
+      # same files.
+      #
+      # 📝 Customize: add a file to the board list only after `git grep -n <name> -- ':!*.md'`
+      # comes back empty. Never add all of **.md or docs/ -- gates and tests read design docs,
+      # and Secret Realm's trace check reads TASKS.md.
+      - name: Compute the change set
+        id: changes
+        shell: bash
+        env:
+          EVENT: ${{ github.event_name }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD: ${{ github.event.pull_request.head.sha }}
+          BEFORE: ${{ github.event.before }}
+          SHA: ${{ github.sha }}
+        run: |
+          base=""
+          head="$SHA"
+          if [ "$EVENT" = "pull_request" ]; then
+            head="$PR_HEAD"
+            base="$(git merge-base "$PR_BASE" "$PR_HEAD")"
+          elif [ -n "$BEFORE" ] && [ "$BEFORE" != "0000000000000000000000000000000000000000" ] \
+               && git cat-file -e "$BEFORE^{commit}" 2>/dev/null; then
+            base="$BEFORE"
+          fi
+          if [ -n "$base" ]; then
+            git -c core.quotePath=false diff --name-only --diff-filter=ACMR "$base..$head" > /tmp/changed.txt
+            # Everything touched, deletions and both sides of a rename included.
+            git -c core.quotePath=false diff --name-only --no-renames "$base..$head" > /tmp/touched.txt
+          else
+            git -c core.quotePath=false ls-tree -r --name-only "$head" > /tmp/changed.txt
+            cp /tmp/changed.txt /tmp/touched.txt
+          fi
+          echo "$(wc -l < /tmp/changed.txt) file(s) in the change set"
+          board_only=false
+          if [ -s /tmp/touched.txt ] \
+             && ! grep -Evq '^(STATUS\.md|HANDOFF\.md|CLAUDE\.md|GEMINI\.md|\.claude/.*)$' /tmp/touched.txt; then
+            board_only=true
+            echo "Only the status board and AI entry points changed, so the gate has nothing to check."
+          fi
+          echo "board_only=$board_only" >> "$GITHUB_OUTPUT"
+
       # --- toolchain -------------------------------------------------------
       # Pinned, not "latest". An unpinned toolchain turns an unrelated upstream
       # release into a red build on a branch that changed nothing. Every action
       # here runs on Node 24; the Node 20 versions they replace are deprecated.
       - name: Set up Python
+        if: steps.changes.outputs.board_only != 'true'
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
         with:
           python-version: '3.13'
@@ -47,39 +110,73 @@ jobs:
       # setup-uv stopped publishing major tags (like @v10) in v8, so it is pinned
       # to a full release. Bump it deliberately; there is no tag that moves for you.
       - name: Set up uv
+        if: steps.changes.outputs.board_only != 'true'
         uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4  # v10.1.0
         with:
+          version: '0.11.32'
           enable-cache: true
 
       - name: Set up Node
+        if: steps.changes.outputs.board_only != 'true'
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020  # v7.0.0
         with:
-          node-version: '24'
+          node-version: '24.21.0'
           # Since v5 this action caches npm dependencies on its own when package.json
-          # names npm as the package manager. This workflow never cached them, and
-          # the install goes through gate.sh -- keep it that way.
+          # names npm as the package manager. Not here: the install goes through gate.sh
+          # -- keep it that way. "Cache downloads" below caches what the install fetches.
           package-manager-cache: false
 
       # pnpm and yarn come with Node through corepack; this puts them on PATH, so a
       # project locked with pnpm-lock.yaml or yarn.lock installs and runs with the
       # manager it was locked with. (bun.lockb needs oven-sh/setup-bun -- add it here.)
       - name: Enable pnpm and yarn
+        if: steps.changes.outputs.board_only != 'true'
         run: corepack enable
 
       # The gate's vulnerability scan checks every lockfile against the OSV database.
       # A pinned release, verified against its published checksum before it runs.
       - name: Set up osv-scanner
+        if: steps.changes.outputs.board_only != 'true'
+        shell: bash
         env:
           OSV_SCANNER_VERSION: v2.5.1
         run: |
           cd "$RUNNER_TEMP"
           base="https://github.com/google/osv-scanner/releases/download/$OSV_SCANNER_VERSION"
-          curl -sSfLO "$base/osv-scanner_linux_amd64"
-          curl -sSfLO "$base/osv-scanner_SHA256SUMS"
+          curl --retry 3 --retry-all-errors -sSfLO "$base/osv-scanner_linux_amd64"
+          curl --retry 3 --retry-all-errors -sSfLO "$base/osv-scanner_SHA256SUMS"
           grep ' osv-scanner_linux_amd64$' osv-scanner_SHA256SUMS | sha256sum -c -
           mkdir -p "$HOME/.local/bin"
           install -m 0755 osv-scanner_linux_amd64 "$HOME/.local/bin/osv-scanner"
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      # Only a project locked with pnpm has a pnpm store worth caching; asking pnpm for its
+      # path anywhere else would fetch pnpm for nothing.
+      - name: Find the pnpm store
+        if: steps.changes.outputs.board_only != 'true'
+        id: pnpm-store
+        env:
+          COREPACK_ENABLE_DOWNLOAD_PROMPT: '0'
+        run: |
+          lock="$(git ls-files '*pnpm-lock.yaml' | head -n 1)"
+          if [ -n "$lock" ]; then
+            echo "path=$(cd "$(dirname "$lock")" && pnpm store path --silent)" >> "$GITHUB_OUTPUT"
+          fi
+
+      # Caches what the installs download, never what they install: gate.sh still runs
+      # every install, so a hit only means less comes over the network. uv's cache is
+      # set-up-uv's (above). The key is the lockfiles, so a dependency change starts a fresh
+      # cache from the nearest old one. A project with no Node lockfile caches nothing.
+      - name: Cache downloads
+        if: steps.changes.outputs.board_only != 'true'
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+        with:
+          path: |
+            ~/.npm
+            ~/.cache/ms-playwright
+            ${{ steps.pnpm-store.outputs.path }}
+          key: downloads-${{ runner.os }}-${{ hashFiles('**/package-lock.json', '**/pnpm-lock.yaml', '**/yarn.lock') }}
+          restore-keys: downloads-${{ runner.os }}-
 
       # --- dependencies ----------------------------------------------------
       # gate.sh treats "dependencies not installed" as a failure, so this step is
@@ -88,26 +185,10 @@ jobs:
       # same package manager as the checks do. This used to be a loop here with its
       # own directory list, and CI stopped installing folders the gate still checked.
       - name: Install dependencies
+        if: steps.changes.outputs.board_only != 'true'
         run: bash scripts/gate.sh --install-deps
 
       # --- the gate --------------------------------------------------------
-      - name: Compute the change set
-        id: changes
-        run: |
-          if [ "${{ github.event_name }}" = "pull_request" ]; then
-            base="${{ github.event.pull_request.base.sha }}"
-            head="${{ github.event.pull_request.head.sha }}"
-            git diff --name-only --diff-filter=ACM "$base..$head" > /tmp/changed.txt
-          else
-            before="${{ github.event.before }}"
-            if [ -n "$before" ] && [ "$before" != "0000000000000000000000000000000000000000" ] \
-               && git cat-file -e "$before^{commit}" 2>/dev/null; then
-              git diff --name-only --diff-filter=ACM "$before..${{ github.sha }}" > /tmp/changed.txt
-            else
-              git ls-tree -r --name-only "${{ github.sha }}" > /tmp/changed.txt
-            fi
-          fi
-          echo "$(wc -l < /tmp/changed.txt) file(s) in the change set"
-
       - name: Run the gate
+        if: steps.changes.outputs.board_only != 'true'
         run: bash scripts/gate.sh --changed-files /tmp/changed.txt
