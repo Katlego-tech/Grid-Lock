@@ -3,7 +3,7 @@
 # to leave my machine / to merge" runs here, and ONLY here.
 #
 #   .githooks/pre-push      -> runs this before a push
-#   .github/workflows/ci.yml -> runs this on every push and PR
+#   .github/workflows/ci.yml -> runs this on every pull request, and on every push to main
 #
 # That is the whole point of the file: the local gate and the pipeline cannot drift
 # apart, because there is only one of them. A build that only works in one person's
@@ -40,6 +40,12 @@ set -u
 # git quotes any path holding a non-ASCII byte ("caf\303\251.py") unless told not to, and
 # a quoted path matches no file on disk -- it would drop out of every sweep silently.
 git() { command git -c core.quotePath=false "$@"; }
+
+# That setting is not enough on its own. A name holding a double quote, a backslash or a tab is
+# still printed quoted ("q\"uote.py"), and it drops out the same way. -z prints every name as
+# it is, so every list of files in this script is read through here, one path per line.
+# tr runs in the C locale: a name need not be valid UTF-8, and BSD tr stops at a byte that isn't.
+ls_files() { git ls-files -z "$@" | LC_ALL=C tr '\0' '\n'; }
 
 root="$(git rev-parse --show-toplevel)"
 cd "$root"
@@ -83,6 +89,10 @@ LOCKFILES=()
 
 say()  { printf '%s\n' "$*"; }
 bad()  { printf '!! %s\n' "$*"; }
+
+# Scratch directories the checks make, removed however the script ends.
+TMP_DIRS=()
+trap '[ "${#TMP_DIRS[@]}" -eq 0 ] || rm -rf "${TMP_DIRS[@]}"' EXIT
 
 # Checks only ever set fail=1, and the step that was running gets the blame when the next one
 # starts. in_step names a check that prints no heading of its own; step prints one too.
@@ -401,7 +411,7 @@ check_node() {
 # production. And a directory with a composer.json is a package like any other: installed,
 # with a test script the gate runs, or declared UNTESTED against a task.
 php_files() {  # tracked PHP files that are the project's own (not vendored, not fixtures)
-  git ls-files -- '*.php' \
+  ls_files -- '*.php' \
     | grep -Ev '(^|/)(docs|legacy|fixtures|mocks|__mocks__|testdata|node_modules|vendor)/' || true
 }
 
@@ -487,6 +497,130 @@ check_composer() {
   fi
 }
 
+# ----------------------------------------------------------------- Maven ----
+# A pom.xml is a project like any other: `mvn verify` compiles it and runs every test
+# phase, so a red suite fails the push the same as a failing pytest. The project's own
+# wrapper (mvnw) is used when it has one, because that is the Maven version it pinned.
+#
+# Maven has no lockfile, and a pom names direct dependencies only. So after the build the
+# gate asks Maven itself for everything it resolved, across every module of the build, as a
+# CycloneDX list, and vuln_scan() reads that. Handing the pom to the scanner instead misses
+# whatever the direct dependencies pull in, and fails on a module that depends on a sibling.
+CYCLONEDX_VERSION=2.9.1   # pinned: the cyclonedx-maven-plugin release that writes the list
+MAVEN_BOMS=()             # one resolved dependency list per Maven build
+
+# The modules the pom in $1 builds by default, as paths from the repo root, one per line, and
+# theirs in turn. $2 is $1's own path from the root ("" for the root). Comments and profiles
+# are cut out first: a module named only in a comment, or in a profile that is off by
+# default, is not built by a plain `mvn verify`, and must not be treated as if it were.
+maven_modules() {
+  local pomdir="$1" prefix="$2" depth="${3:-0}" m
+  [ -f "$pomdir/pom.xml" ] && [ "$depth" -lt 8 ] || return 0
+  while IFS= read -r m; do
+    [ -n "$m" ] || continue
+    printf '%s\n' "$prefix$m"
+    maven_modules "$pomdir/$m" "$prefix$m/" "$((depth + 1))"
+  done < <(awk '
+    { s = s $0 "\n" }
+    function cut(from, to,   i, j, rest) {
+      while ((i = index(s, from)) > 0) {
+        rest = substr(s, i + length(from)); j = index(rest, to)
+        if (j == 0) { s = substr(s, 1, i - 1); break }
+        s = substr(s, 1, i - 1) substr(rest, j + length(to))
+      }
+    }
+    END {
+      cut("<!--", "-->"); cut("<profiles>", "</profiles>")
+      while (match(s, /<module>[^<]*<\/module>/)) {
+        m = substr(s, RSTART + 8, RLENGTH - 17)
+        gsub(/^[ \t\r\n]+|[ \t\r\n]+$/, "", m); sub(/^\.\//, "", m); sub(/\/+$/, "", m)
+        print m
+        s = substr(s, RSTART + RLENGTH)
+      }
+    }' "$pomdir/pom.xml")
+}
+
+check_maven() {
+  local dir="$1" rel="$2" pom marker report bomdir bom declared slug
+  local -a mvn=(mvn)
+  [ -f "$dir/pom.xml" ] || return 0
+  manifests=$((manifests + 1))
+
+  pom="${rel}/pom.xml"; pom="${pom#./}"
+  if ! git ls-files --error-unmatch -- "$pom" >/dev/null 2>&1; then
+    in_step "pom.xml ($rel)"
+    bad "$rel has a pom.xml that is not committed, so nobody else can build what is being"
+    bad "   pushed, and CI cannot check it. Commit it."
+    fail=1
+  fi
+
+  if [ "$rel" != "." ] && maven_modules "$root" "" | grep -Fxq -- "$rel"; then
+    say "   maven: $rel is a module of the root pom, built and scanned by its run"
+    return 0
+  fi
+
+  # Run through sh: a wrapper committed from Windows has often lost its executable bit.
+  [ -f "$dir/mvnw" ] && mvn=(sh ./mvnw)
+  if [ "${mvn[0]}" = mvn ] && ! command -v mvn >/dev/null 2>&1; then
+    in_step "maven environment ($rel)"
+    bad "$rel has a pom.xml but Maven (mvn) is not on PATH -- its suite cannot run."
+    fail=1
+    return 0
+  fi
+  if [ "$list_only" -eq 1 ]; then
+    say "   would run (maven): ${mvn[*]} -B verify ($rel)"
+    return 0
+  fi
+
+  step "${mvn[*]} -B verify ($rel)"
+  marker="$(mktemp)"
+  # A pom can switch its own tests off; these two switch them back on from outside it.
+  ( cd "$dir" && "${mvn[@]}" -B -q -DskipTests=false -Dmaven.test.skip=false verify ) || fail=1
+  ran=$((ran + 1))
+  if [ "$fail" -eq 0 ]; then
+    # A build with no tests exits 0 as well. The reports are what says tests ran: one written
+    # during this run, by surefire (unit) or failsafe (integration), in any module.
+    report="$(find "$dir" \( -path '*/target/surefire-reports/TEST-*.xml' \
+                -o -path '*/target/failsafe-reports/TEST-*.xml' \) -newer "$marker" 2>/dev/null | head -n 1)"
+    if [ -z "$report" ]; then
+      declared="${UNTESTED[$rel]:-}"
+      if [ -n "$declared" ]; then
+        bad "$rel ran no tests -- declared, tracked as $declared."
+        bad "   Its behaviour is unproven. This exemption is not a pass; close $declared."
+      else
+        bad "$rel built, but no test ran: Maven wrote no test report during this run."
+        bad "   Code with no tests ships unproven. Write the suite; if it cannot be written yet,"
+        bad "   the project is BLOCKED: add a task and declare it via UNTESTED[\"$rel\"]."
+        fail=1
+      fi
+    fi
+  fi
+  rm -f "$marker"
+
+  step "maven dependency list ($rel)"
+  bomdir="$(mktemp -d)"; TMP_DIRS+=("$bomdir")
+  slug="${rel//\//_}"; [ "$slug" = "." ] && slug="root"
+  bom="$bomdir/maven-$slug.cdx.json"
+  if ( cd "$dir" && "${mvn[@]}" -B -q \
+         "org.cyclonedx:cyclonedx-maven-plugin:$CYCLONEDX_VERSION:makeAggregateBom" \
+         -DoutputFormat=json -DoutputName=maven -DoutputDirectory="$bomdir" ) \
+     && [ -s "$bomdir/maven.json" ]; then
+    mv "$bomdir/maven.json" "$bom"
+    # The project itself is the list's one entry when it depends on nothing, and a list of
+    # nothing makes the scanner stop with an error instead of a result.
+    if [ "$(grep -c '"purl"' "$bom")" -le 1 ]; then
+      say "   $rel has no dependencies to scan"
+    else
+      say "   resolved by Maven: $(($(grep -c '"purl"' "$bom") - 1)) package(s)"
+      MAVEN_BOMS+=("$bom")
+    fi
+  else
+    bad "Maven could not list what $rel resolves to, so its dependencies cannot be scanned for"
+    bad "   known vulnerabilities. A scan that did not run is a failed scan, not a clean one."
+    fail=1
+  fi
+}
+
 # ------------------------------------------------------------ file lists ----
 # Paths travel through this script as newline-separated lists and are handed to grep and
 # jscpd as arrays -- never as one space-joined string. The sweeps used to build
@@ -506,6 +640,21 @@ existing_files() {
   return 0
 }
 
+# One path per line cannot carry a name that itself holds a line break: it would arrive as
+# two names that match nothing, and both sweeps would pass having skipped the file. Such a
+# name fails the gate here instead. Nothing is counted for this: it is the sweeps' own input.
+file_names() {
+  local names lines
+  names="$(git ls-files -z --cached --others --exclude-standard | LC_ALL=C tr -cd '\0' | wc -c)"
+  lines="$(ls_files --cached --others --exclude-standard | wc -l)"
+  [ "$names" -eq "$lines" ] && return 0
+  in_step "file names"
+  bad "A file name in this repo holds a line break, so the sweeps cannot list it:"
+  command git ls-files --cached --others --exclude-standard | grep '^"' | grep -F '\n' | sed 's/^/     /'
+  bad "   Rename it. A file the sweeps cannot read is a file nobody checked."
+  fail=1
+}
+
 # ---------------------------------------------------------- placeholders ----
 # The central rule: nothing ships with a stub standing in for real work. This is the
 # check that enforces it mechanically rather than by review.
@@ -523,7 +672,7 @@ placeholder_sweep() {
     # Untracked too: a freshly generated scaffold has nothing tracked yet, and a sweep of
     # `git ls-files` alone would read nothing and call it clean.
     say "   no change list given -- sweeping the whole tree, untracked files included"
-    files="$(git ls-files --cached --others --exclude-standard)"
+    files="$(ls_files --cached --others --exclude-standard)"
   fi
 
   # Excluded: markdown and docs (prose about TODOs is not a TODO), fixtures and
@@ -579,7 +728,7 @@ secret_sweep() {
   if [ -n "$changed_files_list" ] && [ -f "$changed_files_list" ]; then
     files="$(cat "$changed_files_list")"
   else
-    files="$(git ls-files --cached --others --exclude-standard)"
+    files="$(ls_files --cached --others --exclude-standard)"
   fi
 
   # Committed env files are the single most common leak, and no content check is
@@ -674,6 +823,92 @@ secret_sweep() {
   ran=$((ran + 1))
 }
 
+# -------------------------------------------------------- secret history ----
+# gitleaks, over every commit this branch is made of, not just the files being pushed. The
+# sweep above reads only the tip of each changed file, so a key committed and then deleted two
+# commits later passes it -- and is still in history, so it is still burned. gitleaks also
+# knows far more key shapes than the sweep's five. A whole history takes about a second.
+#
+# It reads the history of the checked-out commit (HEAD), so the hook and CI scan the same
+# commits and a branch answers for its own history, not for someone else's. A merge commit is
+# compared with its first parent: git's default shows nothing for a merge, and a key added
+# while resolving one would pass.
+#
+# A finding is never fixed by deleting the line: rotate the secret first (security-basics.md).
+# A false positive is allowed in .gitleaks.toml at the repo root, as narrowly as it can be
+# written and with its reason; a rotated secret that stays in old commits goes in
+# .gitleaksignore by fingerprint. --exit-code 3 keeps "found a leak" apart from gitleaks' own
+# exit 1, "could not scan".
+gitleaks_scan() {
+  step "secret history scan (gitleaks)"
+  local rc out config="$root/.gitleaks.toml" allowed ignored
+  local args=(--redact --no-banner --no-color --exit-code 3)
+
+  if ! command -v gitleaks >/dev/null 2>&1; then
+    bad "gitleaks is not on PATH, so git history cannot be scanned for secrets."
+    bad "   Install it: https://github.com/gitleaks/gitleaks#installing"
+    bad "   e.g.  go install github.com/zricethezav/gitleaks/v8@v8.30.1"
+    fail=1
+    return 0
+  fi
+
+  if ! git rev-parse -q --verify HEAD >/dev/null 2>&1; then
+    say "   no commits yet -- there is no history to scan"
+    ran=$((ran + 1))
+    return 0
+  fi
+
+  # A shallow clone holds the last commit or two. Scanning it would report a clean history
+  # having read almost none of it.
+  if [ "$(git rev-parse --is-shallow-repository 2>/dev/null)" = true ]; then
+    bad "This clone is shallow, so most of the history is not here to scan."
+    bad "   Fetch the rest:  git fetch --unshallow   (in CI: actions/checkout with fetch-depth: 0)"
+    fail=1
+    return 0
+  fi
+
+  if [ -f "$config" ]; then
+    # A config replaces gitleaks' own rules unless it extends them. One that doesn't, an empty
+    # file included, leaves the scan with nothing to look for, and it reports clean.
+    if ! grep -Eq '^[[:space:]]*useDefault[[:space:]]*=[[:space:]]*true' "$config"; then
+      bad ".gitleaks.toml does not extend gitleaks' own rules, so it would switch them all off."
+      bad "   Start it with:   [extend]"
+      bad "                    useDefault = true"
+      fail=1
+      return 0
+    fi
+    args+=(--config "$config")
+    allowed="$(grep -Ec '^[[:space:]]*\[\[?allowlists?\]?\]' "$config" || true)"
+    [ "$allowed" -gt 0 ] && bad "   allowed: $allowed allowlist(s) in .gitleaks.toml -- each one is a place the scan does not look."
+  fi
+  if [ -f "$root/.gitleaksignore" ]; then
+    ignored="$(grep -Evc '^[[:space:]]*(#|$)' "$root/.gitleaksignore" || true)"
+    [ "$ignored" -gt 0 ] && bad "   accepted: $ignored finding(s) in .gitleaksignore -- rotated secrets that stay in old commits."
+  fi
+
+  out="$(mktemp)"
+  # The config is this repo's or gitleaks' own, never one a variable on this machine points at.
+  env -u GITLEAKS_CONFIG -u GITLEAKS_CONFIG_TOML \
+    gitleaks git "${args[@]}" --log-opts="--full-history --diff-merges=first-parent HEAD" "$root" 2>&1 | tee "$out"
+  rc=${PIPESTATUS[0]}
+  ran=$((ran + 1))
+  if [ "$rc" -eq 3 ]; then
+    bad "gitleaks found secrets in git history (above, redacted). Rotate each one first --"
+    bad "   it is burned whether or not the commit is rewritten. Then, and only for a false"
+    bad "   positive, allow it in .gitleaks.toml with the reason."
+    fail=1
+  elif [ "$rc" -ne 0 ]; then
+    bad "gitleaks could not complete (exit $rc). A scan that did not run is a failed scan."
+    fail=1
+  elif grep -Eq '(^|[^0-9])0 commits scanned|(^| )ERR( |$)' "$out"; then
+    # gitleaks exits 0 when the git command under it fails: it scans nothing and says clean.
+    bad "gitleaks read no history (see above), so nothing was scanned. That is a failed scan."
+    bad "   The scan needs git 2.31 or newer."
+    fail=1
+  fi
+  rm -f "$out"
+}
+
 # Name the files behind grep -H output ("path:line:text") in the !! block.
 name_hits() {
   local f
@@ -761,15 +996,21 @@ collect_lockfiles() {
 # unchanged code.
 #
 # Exemptions live in osv-scanner.toml at the repo root, one [[IgnoredVulns]] block each,
-# under the same rule as UNTESTED: the reason names the tracked follow-up that will close
-# it (a task ID like T012, or an issue like #12), and every run prints it. An ignoreUntil date makes an exemption expire on its own.
+# under the same rule as UNTESTED: the reason names the task that will close it, and every
+# run prints it. A task is a TASKS.md ID (T045) or, where the work is tracked in GitHub
+# issues, an issue: "#45: ..." at the start of the reason, or "issue #45" anywhere in it. A
+# bare #45 elsewhere is not enough -- "#000000" and "CVSS #3" are not issues. An ignoreUntil
+# date makes an exemption expire on its own.
 osv_exemptions() {   # prints "id<TAB>reason" per [[IgnoredVulns]] block of $1
   awk '
     function flush() { if (inblock) printf "%s\t%s\n", id, reason; inblock = 0; id = ""; reason = "" }
     /^[[:space:]]*\[\[IgnoredVulns\]\]/ { flush(); inblock = 1; next }
     /^[[:space:]]*\[/                   { flush(); next }
     inblock && /^[[:space:]]*id[[:space:]]*=/     { v = $0; sub(/^[^=]*=[[:space:]]*/, "", v); gsub(/"/, "", v); id = v }
-    inblock && /^[[:space:]]*reason[[:space:]]*=/ { v = $0; sub(/^[^=]*=[[:space:]]*/, "", v); gsub(/"/, "", v); reason = v }
+    inblock && /^[[:space:]]*reason[[:space:]]*=/ { v = $0; sub(/^[^=]*=[[:space:]]*/, "", v)
+                                                     # The quoted value only: a comment after it is not the reason.
+                                                     if (match(v, /^"[^"]*"/)) v = substr(v, 2, RLENGTH - 2); else gsub(/"/, "", v)
+                                                     reason = v }
     END { flush() }
   ' "$1"
 }
@@ -790,22 +1031,27 @@ vuln_scan() {
   if [ -f "$config" ]; then
     args+=(--config "$config")
     while IFS=$'\t' read -r id reason; do
-      if printf '%s' "$reason" | grep -qE '(\bT[0-9]+\b|#[0-9]+\b)'; then
+      if printf '%s' "$reason" | grep -qE '(\bT[0-9]+\b|^#[0-9]+\b|\b[Ii]ssues?[ /]?#?[0-9]+\b)'; then
         bad "   accepted: $id -- $reason"
       else
-        bad "   $id is ignored in osv-scanner.toml, but its reason names no tracked follow-up."
-        bad "   An exemption nobody owns is a vulnerability nobody fixes: reason = \"T012: ...\" or \"#12: ...\""
+        bad "   $id is ignored in osv-scanner.toml, but its reason names no task."
+        bad "   An exemption nobody owns is a vulnerability nobody fixes: reason = \"T0nn: ...\""
+        bad "   (or \"#nn: ...\" / \"issue #nn\" where the work is tracked in GitHub issues)."
         fail=1
       fi
     done < <(osv_exemptions "$config")
   fi
 
-  # Everything scanned here is already a full lock, so osv-scanner must not re-resolve it.
-  # Without this it resolves a pinned requirements.txt through deps.dev, and one version
-  # deps.dev doesn't know yet aborts the extraction: 0 packages scanned, exit 127.
+  # Everything scanned here is already a full set of pinned packages -- a lockfile, or the list
+  # Maven resolved -- so osv-scanner must not re-resolve it. Without this it resolves a pinned
+  # requirements.txt through deps.dev, and one version deps.dev doesn't know yet aborts the
+  # extraction: 0 packages scanned, exit 127.
   args+=(--no-resolve)
-  for lock in "${LOCKFILES[@]}"; do args+=(-L "$root/$lock"); done
-  say "   lockfiles: ${LOCKFILES[*]}"
+  for lock in ${LOCKFILES[@]+"${LOCKFILES[@]}"} ${MAVEN_BOMS[@]+"${MAVEN_BOMS[@]}"}; do
+    case "$lock" in /*) args+=(-L "$lock") ;; *) args+=(-L "$root/$lock") ;; esac
+  done
+  [ "${#LOCKFILES[@]}" -gt 0 ] && say "   lockfiles: ${LOCKFILES[*]}"
+  [ "${#MAVEN_BOMS[@]}" -gt 0 ] && say "   maven: ${#MAVEN_BOMS[@]} resolved dependency list(s)"
 
   osv-scanner scan source "${args[@]}"
   rc=$?
@@ -830,7 +1076,9 @@ vuln_scan() {
 #
 # Not counted: tests (repeated, explicit setup is normal there), fixtures and mocks,
 # vendored or built trees, and shadcn/ui's components/ui/ -- copied in from a registry and
-# alike by design. A deliberate copy is marked in the code, with the reason beside it:
+# alike by design. Nor type declarations (*.d.ts): they are generated from a contract and
+# repeat its shapes by construction, so the copy is in the generator's input, not in them.
+# A deliberate copy is marked in the code, with the reason beside it:
 #     # jscpd:ignore-start -- <why this copy is intended>
 #     # jscpd:ignore-end
 duplication_check() {
@@ -838,10 +1086,11 @@ duplication_check() {
   local out rc
   local -a files
 
-  mapfile -t files < <(git ls-files \
+  mapfile -t files < <(ls_files \
             | grep -E '\.(py|ts|tsx|js|jsx|mjs|cjs|go|rs|java|rb|php|c|cc|cpp|h|hpp|cs|kt|swift)$' \
             | grep -Ev '(^|/)(docs|legacy|fixtures|mocks|__mocks__|testdata|node_modules|vendor|dist|build|tests?|__tests__)/' \
             | grep -Ev '(^|/)components/ui/' \
+            | grep -Ev '\.d\.ts$' \
             | grep -Ev '(\.(test|spec)\.[a-z]+|(^|/)test_[^/]*\.py|_test\.(py|go))$' || true)
   if [ "${#files[@]}" -eq 0 ]; then
     say "   no source files to compare"
@@ -940,8 +1189,32 @@ install_deps() {
   fi
 }
 
+# ------------------------------------------------------------- the hook -----
+# The gate only guards a push when the pre-push hook runs it, and git says nothing when there
+# is no hook: a clone where nobody ran install-hooks.sh, or one whose hooks path points at a
+# folder that has since moved. Running the gate by hand is the one moment that can be noticed.
+# A note, not a failure: CI has no hook and needs none.
+hook_note() {
+  [ -z "${CI:-}" ] || return 0
+  local path dir
+  path="$(git config core.hooksPath 2>/dev/null || true)"
+  case "$path" in
+    "") say "note: this clone has no core.hooksPath, so its pushes are not gated. Run: bash install-hooks.sh"
+        return 0 ;;
+    /*) dir="$path" ;;
+    *)  dir="$root/$path" ;;
+  esac
+  [ -f "$dir/pre-push" ] && return 0
+  # A linked worktree of a project that keeps the kit out of git has no hooks folder of its own.
+  say "note: core.hooksPath is '$path', and there is no pre-push hook there, so pushes from here"
+  say "      are not gated. Run: bash install-hooks.sh   (in the main checkout, for a worktree)"
+}
+
 # ------------------------------------------------------------------ run -----
-say "== gate: $(git rev-parse --abbrev-ref HEAD) @ $(git rev-parse --short HEAD) =="
+# A repo with no commit yet has no HEAD to name, and saying so beats git's own error for it.
+say "== gate: $(git symbolic-ref --short -q HEAD || echo "detached HEAD") @ $(git rev-parse --short -q --verify HEAD || echo "no commits yet") =="
+
+[ "$install_only" -eq 1 ] || hook_note
 
 while IFS= read -r dir; do
   rel="${dir#"$root"/}"
@@ -952,6 +1225,7 @@ while IFS= read -r dir; do
     check_python      "$dir" "$rel"
     check_node        "$dir" "$rel"
     check_composer    "$dir" "$rel"
+    check_maven       "$dir" "$rel"
     collect_lockfiles "$dir" "$rel"
   fi
 done < <(project_dirs)
@@ -967,11 +1241,12 @@ fi
 # "nothing was executed".
 if [ "$list_only" -eq 1 ]; then
   say ""
-  say "-> would run: placeholder sweep, secret sweep"
+  say "-> would run: placeholder sweep, secret sweep, secret history scan (gitleaks)"
+  command -v gitleaks >/dev/null 2>&1 || say "   (gitleaks not on PATH -- would FAIL)"
   php_count="$(php_files | grep -c . || true)"
   [ "$php_count" -gt 0 ] && say "-> would run: php -l on $php_count PHP file(s)"
   if [ "$manifests" -gt 0 ]; then
-    say "-> would run: dependency vulnerability scan over: ${LOCKFILES[*]:-(no committed lockfiles)}"
+    say "-> would run: dependency vulnerability scan over: ${LOCKFILES[*]:-(no committed lockfiles)}, and what Maven resolves for any pom.xml"
     command -v osv-scanner >/dev/null 2>&1 || say "   (osv-scanner not on PATH -- would FAIL)"
     say "-> would run: duplication check (jscpd $JSCPD_VERSION, threshold $DUPLICATION_THRESHOLD%)"
     command -v npx >/dev/null 2>&1 || say "   (npx not on PATH -- would FAIL)"
@@ -981,14 +1256,16 @@ if [ "$list_only" -eq 1 ]; then
   exit 0
 fi
 
+file_names
 placeholder_sweep
 secret_sweep
+gitleaks_scan
 php_lint
 
 # Both look at the whole repo rather than one project, so they run once, and only once
 # there is a project to look at.
 if [ "$manifests" -gt 0 ]; then
-  [ "${#LOCKFILES[@]}" -gt 0 ] && vuln_scan
+  if [ "${#LOCKFILES[@]}" -gt 0 ] || [ "${#MAVEN_BOMS[@]}" -gt 0 ]; then vuln_scan; fi
   duplication_check
 fi
 
@@ -1004,20 +1281,18 @@ if [ "$manifests" -eq 0 ]; then
   fi
   if [ -n "$code" ]; then
     bad "Source files are being pushed, but this repo has no project manifest"
-    bad "   (no pyproject.toml / requirements.txt / package.json / composer.json anywhere the gate looks)."
+    bad "   (no pyproject.toml / requirements.txt / package.json / composer.json / pom.xml anywhere the"
+    bad "   gate looks)."
     bad "   The gate cannot check this code, so it will not pretend to have checked it."
     bad "   Add the manifest, or add this directory to project_dirs() in scripts/gate.sh."
     printf '%s\n' "$code" | sed 's/^/     /'
     exit 1
   fi
   say ""
-  say "No project manifests yet -- scaffold-only repo, nothing to build. Placeholder sweep ran."
-elif [ "$ran" -eq 0 ]; then
-  say ""
-  bad "Found $manifests project manifest(s) but ran zero checks."
-  bad "   That is a misconfiguration, not a pass. Fix scripts/gate.sh or the environment."
-  exit 1
+  say "No project manifests yet -- scaffold-only repo, nothing to build. The sweeps ran."
 fi
+# There is no "manifests found, zero checks ran" case to catch here: the sweeps always count,
+# and every way a project's own checks can fail to run sets fail=1 where it happens, by name.
 
 report_failures "gate" && exit 1
 
@@ -1025,4 +1300,5 @@ say ""
 say "== gate passed ($ran check(s) run across $manifests project(s)) =="
 exit 0
 
-# kit: Cultivation 274af9562ecb4e86b8ba6a2998c105571eed0faf
+
+# kit: Cultivation 22e07b1d1b0489410c67f845294e341bdfff0602
