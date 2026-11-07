@@ -1,7 +1,7 @@
 # Design — `reporter-app`
 
 **Status:** `draft` · **Owner:** Katlego (Claude) · **Tasks:** `T008`; implementation tasks under
-US1 · **Spec:** [SPEC.md](../../SPEC.md) `US1`, the reporter persona · **Domain model:**
+US1 · **Spec:** `SPEC.md` `US1`, the reporter persona · **Domain model:**
 [domain-model.md](domain-model.md)
 
 ---
@@ -279,7 +279,7 @@ flowchart TD
 | 5xx | Queue and retry | Treat as rejected: the server's problem would land on the reporter as "not accepted". |
 | Emergency line | On every screen | Only on errors: the person most in need of it is on the compose screen. |
 
-Deviations from [docs/architecture-defaults.md](../architecture-defaults.md): none beyond PLAN.md's
+Deviations from `docs/architecture-defaults.md`: none beyond PLAN.md's
 recorded one (a second client surface).
 
 ## 9. How this is verified
