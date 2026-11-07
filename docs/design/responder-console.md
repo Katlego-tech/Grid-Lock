@@ -1,7 +1,7 @@
 # Design — `responder-console`
 
 **Status:** `draft` · **Owner:** Katlego (Claude) — specifies; Kamo builds `apps/web` ·
-**Tasks:** `T006`; implementation tasks under US5 · **Spec:** [SPEC.md](../../SPEC.md) `US5` ·
+**Tasks:** `T006`; implementation tasks under US5 · **Spec:** `SPEC.md` `US5` ·
 **Domain model:** [domain-model.md](domain-model.md)
 
 ---
@@ -336,7 +336,7 @@ flowchart TD
 | Failure headlines | Closed mapping from triage.md §6.4, raw text as fallback | Showing `failure_reason` raw everywhere: `invalid model output: {…}` is evidence, not a headline. Hiding unknown reasons: a new failure kind would vanish. |
 | Fonts | Self-hosted `@fontsource` | Google Fonts at runtime: a blocked CDN changes the screen's legibility, and the reference's whole type system with it. |
 
-Deviations from [docs/architecture-defaults.md](../architecture-defaults.md): none.
+Deviations from `docs/architecture-defaults.md`: none.
 
 ## 9. How this is verified
 
